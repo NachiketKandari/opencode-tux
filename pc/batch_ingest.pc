@@ -1,0 +1,182 @@
+/*
+ * batch_ingest.pc - Tuxedo Batch Ingestion Service
+ *
+ * Ingests data from external API (JSONPlaceholder) into the staging table.
+ * Uses Pro*C array insert for high-performance bulk loading.
+ *
+ * Service: BATCH_INGEST
+ * Pattern: File/Bulk Ingestion with batch commit every N rows
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <atmi.h>
+#include <userlog.h>
+
+EXEC SQL INCLUDE SQLCA;
+
+/* ─── Host Variable Declarations ──────────────────────────────────────── */
+
+EXEC SQL BEGIN DECLARE SECTION;
+    VARCHAR uid[30];
+    VARCHAR pwd[30];
+
+    /* Batch insert arrays (up to 100 rows per batch) */
+    int     h_post_id[100];
+    int     h_user_id[100];
+    char    h_title[100][256];
+    char    h_body[100][1024];
+    int     h_batch_id;
+    int     h_batch_size;
+
+    /* Status tracking */
+    int     h_total_ingested;
+    char    h_status_msg[256];
+EXEC SQL END DECLARE SECTION;
+
+/* ─── Error Handler ──────────────────────────────────────────────────── */
+
+static void sql_error(char *msg)
+{
+    char err_buf[512];
+    userlog("[FATAL] %s: sqlcode=%ld, msg=%s",
+            msg, sqlca.sqlcode, sqlca.sqlerrm.sqlerrmc);
+    EXEC SQL ROLLBACK;
+}
+
+/* ─── tpsvrinit: Server Boot Initialization ──────────────────────────── */
+
+int tpsvrinit(int argc, char *argv[])
+{
+    userlog("tpsvrinit: Initializing BATCH_INGEST server");
+
+    strcpy((char *)uid.arr, "batch_user");
+    uid.len = strlen((char *)uid.arr);
+    strcpy((char *)pwd.arr, "batch_pass");
+    pwd.len = strlen((char *)pwd.arr);
+
+    EXEC SQL WHENEVER SQLERROR DO sql_error("tpsvrinit CONNECT");
+    EXEC SQL CONNECT :uid IDENTIFIED BY :pwd;
+
+    if (sqlca.sqlcode != 0) {
+        userlog("tpsvrinit: CONNECT failed. sqlcode=%ld", sqlca.sqlcode);
+        return -1;
+    }
+
+    userlog("tpsvrinit: Database connection established");
+    return 0;
+}
+
+/* ─── tpsvrdone: Server Shutdown ─────────────────────────────────────── */
+
+void tpsvrdone(void)
+{
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+    EXEC SQL COMMIT WORK RELEASE;
+    userlog("tpsvrdone: Disconnected. Total ingested this session: %d",
+            h_total_ingested);
+}
+
+/* ─── BATCH_INGEST Service ──────────────────────────────────────────────
+ *
+ * Receives: JSON data buffer in rqst->data
+ * Processes: Parses JSON records, bulk inserts into posts_staging
+ * Returns:  Status message and count of rows ingested
+ *
+ * Batch commit strategy: commit every 500 rows to manage transaction
+ * log size, exactly as done in production Tuxedo batch loaders.
+ */
+
+void BATCH_INGEST(TPSVCINFO *rqst)
+{
+    int   record_count = 0;
+    char  *data_ptr = rqst->data;
+    int   total_in_batch = 0;
+
+    userlog("BATCH_INGEST: Starting ingestion. Input size=%ld bytes", rqst->len);
+
+    /*
+     * Parse JSONLines from rqst->data
+     * Format: user_id|id|title|body (pipe-delimited for simplicity)
+     */
+    EXEC SQL WHENEVER SQLERROR GOTO ingest_error;
+
+    h_batch_id = (int)time(NULL);  /* batch identifier */
+    h_total_ingested = 0;
+    h_batch_size = 0;
+
+    /* ── Main ingestion loop ── */
+    char *line = strtok(data_ptr, "\n");
+    while (line != NULL) {
+        /* Parse: user_id|post_id|title|body */
+        int uid, pid;
+        char title[256], body[1024];
+
+        if (sscanf(line, "%d|%d|%[^|]|%[^\n]",
+                   &uid, &pid, title, body) == 4) {
+
+            /* Populate host arrays */
+            h_post_id[h_batch_size] = pid;
+            h_user_id[h_batch_size] = uid;
+            strncpy(h_title[h_batch_size], title, 255);
+            h_title[h_batch_size][255] = '\0';
+            strncpy(h_body[h_batch_size], body, 1023);
+            h_body[h_batch_size][1023] = '\0';
+
+            h_batch_size++;
+            record_count++;
+            total_in_batch++;
+
+            /* Flush when array is full */
+            if (h_batch_size >= 100) {
+                EXEC SQL FOR :h_batch_size
+                    INSERT INTO posts_staging (id, user_id, title, body, ingest_batch_id)
+                    VALUES (:h_post_id, :h_user_id, :h_title, :h_body, :h_batch_id);
+
+                h_total_ingested += sqlca.sqlerrd[2];
+                h_batch_size = 0;
+
+                /* Commit every 500 records */
+                if (total_in_batch >= 500) {
+                    EXEC SQL COMMIT;
+                    userlog("BATCH_INGEST: Committed batch. Total=%d",
+                            h_total_ingested);
+                    total_in_batch = 0;
+                }
+            }
+        }
+        line = strtok(NULL, "\n");
+    }
+
+    /* ── Final partial batch flush ── */
+    if (h_batch_size > 0) {
+        EXEC SQL FOR :h_batch_size
+            INSERT INTO posts_staging (id, user_id, title, body, ingest_batch_id)
+            VALUES (:h_post_id, :h_user_id, :h_title, :h_body, :h_batch_id);
+
+        h_total_ingested += sqlca.sqlerrd[2];
+        EXEC SQL COMMIT;
+        userlog("BATCH_INGEST: Final flush. %d rows. Total=%d",
+                h_batch_size, h_total_ingested);
+    }
+
+    /* ── Log batch completion ── */
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed)
+        VALUES ('BATCH_INGEST', 'SUCCESS', :h_total_ingested);
+
+    /* ── Return success ── */
+    snprintf(h_status_msg, sizeof(h_status_msg),
+             "OK|ingested=%d|batch_id=%d", h_total_ingested, h_batch_id);
+    tpreturn(TPSUCCESS, 0, h_status_msg, strlen(h_status_msg) + 1, 0);
+    return;
+
+ingest_error:
+    EXEC SQL ROLLBACK;
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed, error_message)
+        VALUES ('BATCH_INGEST', 'FAILED', :h_total_ingested, 'SQL error during ingestion');
+
+    snprintf(h_status_msg, sizeof(h_status_msg),
+             "FAIL|ingested=%d|sqlcode=%ld", h_total_ingested, sqlca.sqlcode);
+    tpreturn(TPFAIL, sqlca.sqlcode, h_status_msg, 0, 0);
+}

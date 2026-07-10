@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "batch-framework"
+version = "0.1.0"
+description = "Idiomatic Python batch processing framework — Tuxedo/Pro*C replacement"
+requires-python = ">=3.11"
+dependencies = [
+    "oracledb>=2.0",
+    "structlog>=24.0",
+    "prometheus-client>=0.19",
+    "typer>=0.12",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+batch-ingest           = "services.ingest:main"
+batch-equity-ingest    = "services.equity_ingest:main"
+batch-portfolio-processor = "services.portfolio_processor:main"
+batch-validate         = "services.validate:main"
+batch-transform        = "services.transform:main"
+batch-report           = "services.report:main"
+batch-orchestrator     = "services.orchestrator:main"
+
+[tool.setuptools.package-dir]
+"" = "src"

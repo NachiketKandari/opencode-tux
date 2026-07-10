@@ -1,0 +1,15 @@
+build/
+bin/
+data/batch.db
+data/batch.db-shm
+data/batch.db-wal
+data/input.dat
+data/eod_input.dat
+screenshots/
+*.o
+*.dSYM/
+.DS_Store
+.venv/
+*.egg-info/
+.pytest_cache/
+__pycache__/

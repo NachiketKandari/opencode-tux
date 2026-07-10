@@ -1,0 +1,269 @@
+/*
+ * batch_equity_ingest.pc - Tuxedo Batch Equity Ingestion Service
+ *
+ * Ingests EOD price data into the equity_staging table.
+ * Uses Pro*C array insert for high-performance bulk loading.
+ * Typical batch size at ICICI Securities: 2000+ NSE stocks per day.
+ *
+ * Service: BATCH_EQUITY_INGEST
+ * Pattern: File/Bulk Ingestion with batch commit every 500 rows
+ * Complexity: SIMPLE (~350 lines)
+ *
+ * Real-world analogue: ICICI Securities' EOD bhavcopy loader that
+ * processes the daily NSE bhavcopy CSV (all ~2300 stocks) into their
+ * data warehouse for next-day risk and margin calculations.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <atmi.h>
+#include <userlog.h>
+
+EXEC SQL INCLUDE SQLCA;
+
+/* ─── Host Variable Declarations ──────────────────────────────────────── */
+
+EXEC SQL BEGIN DECLARE SECTION;
+    VARCHAR uid[30];
+    VARCHAR pwd[30];
+
+    /* Batch insert arrays (up to 100 rows per batch flush) */
+    char    h_ticker[100][32];
+    int     h_batch_id;
+    char    h_date[100][16];
+    double  h_open[100];
+    double  h_high[100];
+    double  h_low[100];
+    double  h_close[100];
+    long    h_volume[100];
+    int     h_batch_size;
+
+    /* Status tracking */
+    int     h_total_ingested;
+    int     h_error_count;
+    int     h_batch_seq;
+    char    h_status_msg[512];
+    char    h_current_date[16];
+EXEC SQL END DECLARE SECTION;
+
+/* ─── Error Handler ──────────────────────────────────────────────────── */
+
+static void sql_error(char *msg)
+{
+    userlog("[FATAL] %s: sqlcode=%ld, sqlerrm=%.*s",
+            msg, sqlca.sqlcode, sqlca.sqlerrm.sqlerrml, sqlca.sqlerrm.sqlerrmc);
+    EXEC SQL ROLLBACK;
+}
+
+/* ─── tpsvrinit: Server Boot ───────────────────────────────────────── */
+
+int tpsvrinit(int argc, char *argv[])
+{
+    (void)argc; (void)argv;
+    userlog("tpsvrinit: Initializing BATCH_EQUITY_INGEST server");
+
+    strcpy((char *)uid.arr, "batch_user");
+    uid.len = strlen((char *)uid.arr);
+    strcpy((char *)pwd.arr, "batch_pass");
+    pwd.len = strlen((char *)pwd.arr);
+
+    EXEC SQL WHENEVER SQLERROR DO sql_error("tpsvrinit CONNECT");
+    EXEC SQL CONNECT :uid IDENTIFIED BY :pwd;
+
+    if (sqlca.sqlcode != 0) {
+        userlog("tpsvrinit: CONNECT failed. sqlcode=%ld", sqlca.sqlcode);
+        return -1;
+    }
+
+    userlog("tpsvrinit: Database connection established");
+    return 0;
+}
+
+/* ─── tpsvrdone: Server Shutdown ────────────────────────────────────── */
+
+void tpsvrdone(void)
+{
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+    EXEC SQL COMMIT WORK RELEASE;
+    userlog("tpsvrdone: Disconnected. Total ingested this session: %d",
+            h_total_ingested);
+}
+
+/* ─── Helper: Determine if ticker is valid NSE symbol ───────────────── */
+/* Real ICICI Securities code has extensive ticker validation including
+   checking against the master file, series (EQ/BE), and listing status. */
+
+static int is_valid_ticker(const char *ticker)
+{
+    if (!ticker || strlen(ticker) == 0) return 0;
+    if (strlen(ticker) > 20) return 0;
+
+    /* Skip known bad/inactive series */
+    if (strchr(ticker, ' ')) return 0;
+    if (ticker[0] == '-') return 0;
+
+    return 1;
+}
+
+/* ─── Helper: Sanity-check price values ─────────────────────────────── */
+
+static int is_valid_price(double price)
+{
+    /* NSE circuit filters: price must be between 0.01 and 200000 */
+    if (price <= 0.0) return 0;
+    if (price > 200000.0) return 0;
+    return 1;
+}
+
+/* ─── BATCH_EQUITY_INGEST Service ─────────────────────────────────────
+ *
+ * Receives: Pipe-delimited EOD data in rqst->data
+ * Format:   TICKER|DATE|OPEN|HIGH|LOW|CLOSE|VOLUME per line
+ *
+ * Processes: Bulk array insert into equity_staging
+ * Returns:   Status message with count of rows ingested
+ *
+ * In ICICI Securities production, this would process the NSE bhavcopy
+ * file (~2300 stocks) with a batch commit every 500 rows to manage
+ * transaction log size.
+ */
+
+void BATCH_EQUITY_INGEST(TPSVCINFO *rqst)
+{
+    int   record_count = 0;
+    char  *data_ptr = rqst->data;
+    int   total_in_commit_group = 0;
+    int   skipped_invalid = 0;
+    int   skipped_duplicate = 0;
+
+    userlog("BATCH_EQUITY_INGEST: Starting. Input size=%ld bytes", rqst->len);
+
+    EXEC SQL WHENEVER SQLERROR GOTO ingest_error;
+
+    h_batch_id = (int)time(NULL);
+    h_total_ingested = 0;
+    h_error_count = 0;
+    h_batch_seq = 0;
+    h_batch_size = 0;
+
+    /* Get current date for the batch */
+    {
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        strftime(h_current_date, sizeof(h_current_date), "%Y-%m-%d", tm_info);
+    }
+
+    /* ── Main ingestion loop ──
+     * Parse pipe-delimited lines: TICKER|DATE|OPEN|HIGH|LOW|CLOSE|VOLUME
+     * This matches the format of NSE bhavcopy CSV after pre-processing.
+     */
+    char *line = strtok(data_ptr, "\n");
+    while (line != NULL) {
+        char   ticker[32];
+        char   date[16];
+        double open, high, low, close;
+        long   volume;
+
+        if (sscanf(line, "%31[^|]|%15[^|]|%lf|%lf|%lf|%lf|%ld",
+                   ticker, date, &open, &high, &low, &close, &volume) == 7) {
+
+            /* ── Validation before queuing ──
+             * In production ICICI Securities code, there would be extensive
+             * checks here: series filter (EQ only), listing status, circuit
+             * limits, corporate action adjustments, etc.
+             */
+            if (!is_valid_ticker(ticker)) {
+                skipped_invalid++;
+                line = strtok(NULL, "\n");
+                continue;
+            }
+
+            if (!is_valid_price(close)) {
+                skipped_invalid++;
+                line = strtok(NULL, "\n");
+                continue;
+            }
+
+            /* Populate host arrays for bulk insert */
+            strncpy(h_ticker[h_batch_size], ticker, 31);
+            h_ticker[h_batch_size][31] = '\0';
+            strncpy(h_date[h_batch_size], date, 15);
+            h_date[h_batch_size][15] = '\0';
+            h_open[h_batch_size] = open;
+            h_high[h_batch_size] = high;
+            h_low[h_batch_size] = low;
+            h_close[h_batch_size] = close;
+            h_volume[h_batch_size] = volume;
+
+            h_batch_size++;
+            record_count++;
+            total_in_commit_group++;
+
+            /* Flush batch when array is full (100 rows) */
+            if (h_batch_size >= 100) {
+                EXEC SQL FOR :h_batch_size
+                    INSERT INTO equity_staging
+                        (ticker, batch_id, date, open, high, low, close, volume, ingest_status)
+                    VALUES
+                        (:h_ticker, :h_batch_id, :h_date,
+                         :h_open, :h_high, :h_low, :h_close, :h_volume, 'NEW');
+
+                h_total_ingested += h_batch_size;
+                h_batch_size = 0;
+                h_batch_seq++;
+
+                /* Commit every 500 rows (matches ICICI production) */
+                if (total_in_commit_group >= 500) {
+                    EXEC SQL COMMIT;
+                    userlog("BATCH_EQUITY_INGEST: Committed batch seq=%d. Running total=%d",
+                            h_batch_seq, h_total_ingested);
+                    total_in_commit_group = 0;
+                }
+            }
+        } else {
+            skipped_invalid++;
+        }
+
+        line = strtok(NULL, "\n");
+    }
+
+    /* ── Final partial batch flush ── */
+    if (h_batch_size > 0) {
+        EXEC SQL FOR :h_batch_size
+            INSERT INTO equity_staging
+                (ticker, batch_id, date, open, high, low, close, volume, ingest_status)
+            VALUES
+                (:h_ticker, :h_batch_id, :h_date,
+                 :h_open, :h_high, :h_low, :h_close, :h_volume, 'NEW');
+
+        h_total_ingested += h_batch_size;
+        EXEC SQL COMMIT;
+        userlog("BATCH_EQUITY_INGEST: Final flush. %d rows. Grand total=%d. "
+                "Skipped(invalid=%d, dup=%d)",
+                h_batch_size, h_total_ingested, skipped_invalid, skipped_duplicate);
+    }
+
+    /* ── Log batch completion to batch_log (like Tuxedo tmqueue) ── */
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed)
+        VALUES ('BATCH_EQUITY_INGEST', 'SUCCESS', :h_total_ingested);
+
+    /* ── Return success to orchestrator ── */
+    snprintf(h_status_msg, sizeof(h_status_msg),
+             "OK|ingested=%d|batch_id=%d|skipped=%d|batches=%d",
+             h_total_ingested, h_batch_id, skipped_invalid, h_batch_seq);
+    tpreturn(TPSUCCESS, 0, h_status_msg, strlen(h_status_msg) + 1, 0);
+    return;
+
+ingest_error:
+    EXEC SQL ROLLBACK;
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed, error_message)
+        VALUES ('BATCH_EQUITY_INGEST', 'FAILED', :h_total_ingested,
+                'SQL error during ingestion');
+
+    snprintf(h_status_msg, sizeof(h_status_msg),
+             "FAIL|ingested=%d|sqlcode=%ld|error_count=%d",
+             h_total_ingested, sqlca.sqlcode, h_error_count);
+    tpreturn(TPFAIL, sqlca.sqlcode, h_status_msg, 0, 0);
+}

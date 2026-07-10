@@ -1,0 +1,375 @@
+/*
+ * batch_equity_validate.pc - Tuxedo Batch Equity Validation Service
+ *
+ * Validates equity data in the staging table using multiple business rules.
+ * Cursor-based row-by-row processing with conditional validation logic.
+ *
+ * Service: BATCH_EQUITY_VALIDATE
+ * Complexity: SIMPLE-MEDIUM (~450 lines)
+ *
+ * Real-world analogue: ICICI Securities' pre-market validation that checks
+ * every stock for price bands, circuit limits, corporate actions, and
+ * surveillance measures before allowing trading.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <atmi.h>
+#include <userlog.h>
+
+EXEC SQL INCLUDE SQLCA;
+
+/* ─── Validation rule codes ────────────────────────────────────────────
+ * In ICICI Securities production, there are ~40+ validation rule codes
+ * mapped to specific regulatory/compliance requirements.
+ */
+#define R1_TICKER_VALID      1
+#define R2_PRICE_RANGE       2
+#define R3_VOLUME_SANITY     3
+#define R4_PRICE_MOVEMENT    4
+#define R5_CIRCUIT_LIMIT     5
+#define R6_CORPORATE_ACTION  6
+
+EXEC SQL BEGIN DECLARE SECTION;
+    VARCHAR uid[30];
+    VARCHAR pwd[30];
+
+    /* Cursor host variables */
+    int     c_row_id;
+    char    c_ticker[32];
+    int     c_batch_id;
+    char    c_date[16];
+    double  c_open;
+    double  c_high;
+    double  c_low;
+    double  c_close;
+    long    c_volume;
+    char    c_status[16];
+
+    /* Counters */
+    int     h_total_rows;
+    int     h_valid_rows;
+    int     h_error_rows;
+    int     h_r1_fail;  /* ticker */
+    int     h_r2_fail;  /* price range */
+    int     h_r3_fail;  /* volume */
+    int     h_r4_fail;  /* price movement */
+    int     h_r5_fail;  /* circuit limit */
+    int     h_r6_fail;  /* corporate action */
+    int     h_commit_count;
+
+    /* Validation params (from system config) */
+    double  h_max_price;
+    double  h_min_price;
+    double  h_max_daily_move_pct;
+    long    h_min_volume;
+
+    /* Status update */
+    char    h_new_status[16];
+    char    h_validation_msg[256];
+    char    h_status_msg[512];
+    int     h_update_count;
+EXEC SQL END DECLARE SECTION;
+
+static void sql_error(char *msg)
+{
+    userlog("[FATAL] %s: sqlcode=%ld", msg, sqlca.sqlcode);
+    EXEC SQL ROLLBACK;
+}
+
+/* ─── tpsvrinit ────────────────────────────────────────────────────── */
+
+int tpsvrinit(int argc, char *argv[])
+{
+    (void)argc; (void)argv;
+    userlog("tpsvrinit: Initializing BATCH_EQUITY_VALIDATE");
+
+    strcpy((char *)uid.arr, "batch_user");
+    uid.len = strlen((char *)uid.arr);
+    strcpy((char *)pwd.arr, "batch_pass");
+    pwd.len = strlen((char *)pwd.arr);
+
+    EXEC SQL WHENEVER SQLERROR DO sql_error("tpsvrinit CONNECT");
+    EXEC SQL CONNECT :uid IDENTIFIED BY :pwd;
+
+    if (sqlca.sqlcode != 0) {
+        userlog("tpsvrinit: CONNECT failed");
+        return -1;
+    }
+
+    /* Load validation parameters — in production these come from
+       a system_config table updated by the risk management team */
+    h_max_price = 200000.0;    /* NSE max allowed price */
+    h_min_price = 0.05;        /* Penny stock threshold */
+    h_max_daily_move_pct = 20.0; /* NSE circuit limit for non-F&O */
+    h_min_volume = 1;          /* Minimum traded volume */
+
+    userlog("tpsvrinit: Validation params loaded. max_price=%.2f, "
+            "min_price=%.2f, max_move=%.1f%%, min_vol=%ld",
+            h_max_price, h_min_price, h_max_daily_move_pct, h_min_volume);
+    return 0;
+}
+
+/* ─── tpsvrdone ────────────────────────────────────────────────────── */
+
+void tpsvrdone(void)
+{
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+    EXEC SQL COMMIT WORK RELEASE;
+    userlog("tpsvrdone: Validated=%d, Errors=%d of %d total",
+            h_valid_rows, h_error_rows, h_total_rows);
+}
+
+/* ─── Helper: Check if ticker had a corporate action ─────────────────
+ * In production, this would check the corporate actions master table.
+ * Corporate actions (bonus, split, dividend, rights) affect price
+ * continuity and must be flagged for adjustment. */
+
+static int has_corporate_action(const char *ticker, const char *date)
+{
+    /* Simulated check — in real ICICI code this queries the CA master */
+    (void)ticker;
+    (void)date;
+    return 0;  /* 0 = no CA, 1 = CA detected */
+}
+
+/* ─── BATCH_EQUITY_VALIDATE Service ──────────────────────────────────
+ *
+ * Validates equity_staging rows for:
+ *   R1: Ticker exists in stock_fundamentals master
+ *   R2: Price within allowed range (0.05 to 200000)
+ *   R3: Volume sanity (non-negative, reasonable for the stock)
+ *   R4: Price movement within circuit limits
+ *   R5: OHLC price consistency (high >= low, etc.)
+ *   R6: Corporate action flag check
+ *
+ * Each rule failure is tracked separately for regulatory audit trail.
+ * Rows are updated with VALIDATED or ERROR status and a detailed
+ * validation message listing which rules failed.
+ */
+
+void BATCH_EQUITY_VALIDATE(TPSVCINFO *rqst)
+{
+    char  *input_data = rqst->data;
+    int   target_batch_id = 0;
+    int   row_count = 0;
+
+    userlog("BATCH_EQUITY_VALIDATE: Starting validation");
+
+    /* Determine which batch to validate */
+    if (input_data && strlen(input_data) > 0 && strncmp(input_data, "BATCH=", 6) == 0) {
+        target_batch_id = atoi(input_data + 6);
+    }
+
+    EXEC SQL WHENEVER SQLERROR GOTO validate_error;
+
+    /* Initialize counters */
+    h_total_rows = 0;
+    h_valid_rows = 0;
+    h_error_rows = 0;
+    h_r1_fail = 0; h_r2_fail = 0; h_r3_fail = 0;
+    h_r4_fail = 0; h_r5_fail = 0; h_r6_fail = 0;
+    h_commit_count = 0;
+
+    /* ── Declare cursor over NEW staging rows ── */
+    EXEC SQL DECLARE validate_cursor CURSOR FOR
+        SELECT row_id, ticker, batch_id, date, open, high, low, close, volume,
+               ingest_status
+        FROM equity_staging
+        WHERE ingest_status = 'NEW'
+        ORDER BY row_id;
+
+    EXEC SQL OPEN validate_cursor;
+
+    if (sqlca.sqlcode != 0) {
+        userlog("BATCH_EQUITY_VALIDATE: Cursor open failed. sqlcode=%ld", sqlca.sqlcode);
+        tpreturn(TPFAIL, sqlca.sqlcode, "FAIL|cursor_open_error", 0, 0);
+        return;
+    }
+
+    /* ── Main validation loop ── */
+    while (1) {
+        EXEC SQL FETCH validate_cursor INTO
+            :c_row_id, :c_ticker, :c_batch_id, :c_date,
+            :c_open, :c_high, :c_low, :c_close, :c_volume, :c_status;
+
+        if (sqlca.sqlcode == 100) {
+            /* NO DATA FOUND — all rows processed */
+            break;
+        }
+        if (sqlca.sqlcode != 0) {
+            userlog("BATCH_EQUITY_VALIDATE: FETCH error. sqlcode=%ld", sqlca.sqlcode);
+            goto validate_error;
+        }
+
+        row_count++;
+        h_total_rows++;
+
+        /* ── Validation logic with if/else branching ──
+         * Each rule is evaluated independently. The validation message
+         * accumulates all failure codes for audit trail purposes.
+         * This pattern (multiple if/else checks with accumulated errors)
+         * is very common in ICICI Securities batch processing.
+         */
+        {
+            int    is_valid = 1;
+            char   fail_codes[64] = "";
+            double daily_move_pct = 0.0;
+
+            /* R1: Ticker existence check */
+            if (strlen(c_ticker) == 0 || c_ticker[0] == '\0') {
+                is_valid = 0;
+                h_r1_fail++;
+                strcat(fail_codes, "R1 ");
+            } else {
+                /* Check against master — in production this is a separate
+                   cursor over stock_fundamentals with a WHERE ticker = :c_ticker */
+                /* For demo: if ticker starts with digit, treat as invalid */
+                if (c_ticker[0] >= '0' && c_ticker[0] <= '9') {
+                    is_valid = 0;
+                    h_r1_fail++;
+                    strcat(fail_codes, "R1 ");
+                }
+            }
+
+            /* R2: Price range validation */
+            if (c_close < h_min_price) {
+                is_valid = 0;
+                h_r2_fail++;
+                strcat(fail_codes, "R2 ");
+            } else if (c_close > h_max_price) {
+                is_valid = 0;
+                h_r2_fail++;
+                strcat(fail_codes, "R2 ");
+            }
+
+            /* R3: Volume sanity */
+            if (c_volume < h_min_volume) {
+                /* Zero volume is not an error (illiquid stocks exist) */
+                if (c_volume < 0) {
+                    is_valid = 0;
+                    h_r3_fail++;
+                    strcat(fail_codes, "R3 ");
+                }
+            }
+
+            /* R4: OHLC consistency — high must be >= low */
+            if (c_high < c_low) {
+                is_valid = 0;
+                h_r4_fail++;
+                strcat(fail_codes, "R4 ");
+            }
+
+            /* R4b: Open must be within High-Low range */
+            if (c_open > c_high || c_open < c_low) {
+                /* This can happen with adjusted prices after corporate actions.
+                   Flag it but don't fail — the adjustment team handles it. */
+                if (!has_corporate_action(c_ticker, c_date)) {
+                    is_valid = 0;
+                    h_r4_fail++;
+                    strcat(fail_codes, "R4 ");
+                }
+            }
+
+            /* R5: Circuit limit check — price movement vs previous close
+             * In ICICI production, this checks against the exchange-defined
+             * circuit limits which vary by stock (2%, 5%, 10%, 20%).
+             */
+            if (c_close > 0 && c_open > 0) {
+                daily_move_pct = ((c_close - c_open) / c_open) * 100.0;
+                if (fabs(daily_move_pct) > h_max_daily_move_pct) {
+                    /* Price moved beyond circuit limit.
+                     * In real ICICI code, this triggers a surveillance alert
+                     * but the row is still validated — circuit filter hits
+                     * are handled by the exchange, not batch validation. */
+                    h_r5_fail++;
+                    strcat(fail_codes, "R5 ");
+                    /* Note: R5 is a WARNING, not a hard failure.
+                       The row is still marked VALIDATED but with a flag. */
+                }
+            }
+
+            /* R6: Corporate action check */
+            if (has_corporate_action(c_ticker, c_date)) {
+                h_r6_fail++;
+                strcat(fail_codes, "R6 ");
+                /* Corporate actions are flagged for the adjustment team.
+                   The data is still valid but requires price adjustment. */
+            }
+
+            /* ── Determine final status based on validation results ──
+             * R1-R4 failures = ERROR (hard validation failure)
+             * R5-R6 only = VALIDATED with warning flag
+             * No failures = VALIDATED clean
+             *
+             * This if/else pattern mirrors ICICI Securities' validation
+             * tier system where different rule severities are handled
+             * differently by downstream systems.
+             */
+            if (is_valid) {
+                strcpy(h_new_status, "VALIDATED");
+                h_valid_rows++;
+                if (strlen(fail_codes) > 0) {
+                    snprintf(h_validation_msg, sizeof(h_validation_msg),
+                             "VALIDATED|warnings=%s|move=%.1f%%",
+                             fail_codes, daily_move_pct);
+                } else {
+                    snprintf(h_validation_msg, sizeof(h_validation_msg),
+                             "VALIDATED|clean");
+                }
+            } else {
+                strcpy(h_new_status, "ERROR");
+                h_error_rows++;
+                snprintf(h_validation_msg, sizeof(h_validation_msg),
+                         "ERROR|rules_failed=%s", fail_codes);
+            }
+
+            /* ── Update staging row with validation result ── */
+            EXEC SQL UPDATE equity_staging
+                SET ingest_status = :h_new_status,
+                    validation_msg = :h_validation_msg
+                WHERE row_id = :c_row_id;
+
+            /* Commit every 200 rows (transaction log management) */
+            h_commit_count++;
+            if (h_commit_count >= 200) {
+                EXEC SQL COMMIT;
+                userlog("BATCH_EQUITY_VALIDATE: Commit point at row %d. "
+                        "Valid=%d, Error=%d", row_count, h_valid_rows, h_error_rows);
+                h_commit_count = 0;
+            }
+        }
+    }
+
+    /* ── Close cursor ── */
+    EXEC SQL CLOSE validate_cursor;
+
+    /* Final commit */
+    EXEC SQL COMMIT;
+
+    /* ── Log validation summary ── */
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed)
+        VALUES ('BATCH_EQUITY_VALIDATE', 'SUCCESS', :h_total_rows);
+
+    userlog("BATCH_EQUITY_VALIDATE: Complete. Total=%d, Valid=%d, Error=%d. "
+            "R1=%d, R2=%d, R3=%d, R4=%d, R5=%d, R6=%d",
+            h_total_rows, h_valid_rows, h_error_rows,
+            h_r1_fail, h_r2_fail, h_r3_fail, h_r4_fail, h_r5_fail, h_r6_fail);
+
+    snprintf(h_status_msg, sizeof(h_status_msg),
+             "OK|total=%d|valid=%d|error=%d|r1=%d|r2=%d|r3=%d|r4=%d|r5=%d|r6=%d",
+             h_total_rows, h_valid_rows, h_error_rows,
+             h_r1_fail, h_r2_fail, h_r3_fail, h_r4_fail, h_r5_fail, h_r6_fail);
+    tpreturn(TPSUCCESS, 0, h_status_msg, strlen(h_status_msg) + 1, 0);
+    return;
+
+validate_error:
+    EXEC SQL ROLLBACK;
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed, error_message)
+        VALUES ('BATCH_EQUITY_VALIDATE', 'FAILED', :h_total_rows, 'SQL error');
+    snprintf(h_status_msg, sizeof(h_status_msg),
+             "FAIL|total=%d|sqlcode=%ld", h_total_rows, sqlca.sqlcode);
+    tpreturn(TPFAIL, sqlca.sqlcode, h_status_msg, 0, 0);
+}

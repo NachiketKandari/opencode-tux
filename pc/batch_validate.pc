@@ -1,0 +1,221 @@
+/*
+ * batch_validate.pc - Tuxedo Batch Validation Service
+ *
+ * Validates data in the staging table before transformation.
+ * Checks required fields, data types, and business rules.
+ *
+ * Service: BATCH_VALIDATE
+ * Pattern: Cursor-based validation with row-level error tracking
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <atmi.h>
+#include <userlog.h>
+
+EXEC SQL INCLUDE SQLCA;
+
+/* ─── Host Variable Declarations ──────────────────────────────────────── */
+
+EXEC SQL BEGIN DECLARE SECTION;
+    VARCHAR uid[30];
+    VARCHAR pwd[30];
+
+    /* Row-at-a-time validation variables */
+    int     h_post_id;
+    int     h_user_id;
+    char    h_title[256];
+    char    h_body[1024];
+    int     h_batch_id;
+
+    /* Validation counters */
+    int     h_valid_count;
+    int     h_invalid_count;
+    int     h_empty_title_count;
+    int     h_empty_body_count;
+    int     h_short_body_count;
+
+    /* Status message */
+    char    h_status_msg[512];
+EXEC SQL END DECLARE SECTION;
+
+/* ─── Cursor Declaration ──────────────────────────────────────────────── */
+
+EXEC SQL DECLARE c_staging CURSOR FOR
+    SELECT id, user_id, title, body
+    FROM posts_staging
+    WHERE ingest_status = 'NEW'
+      AND ingest_batch_id = :h_batch_id;
+
+/* ─── tpsvrinit ────────────────────────────────────────────────────────── */
+
+int tpsvrinit(int argc, char *argv[])
+{
+    userlog("tpsvrinit: Initializing BATCH_VALIDATE server");
+
+    strcpy((char *)uid.arr, "batch_user");
+    uid.len = strlen((char *)uid.arr);
+    strcpy((char *)pwd.arr, "batch_pass");
+    pwd.len = strlen((char *)pwd.arr);
+
+    EXEC SQL CONNECT :uid IDENTIFIED BY :pwd;
+
+    if (sqlca.sqlcode != 0) {
+        userlog("tpsvrinit: CONNECT failed with sqlcode=%ld", sqlca.sqlcode);
+        return -1;
+    }
+
+    userlog("tpsvrinit: Connected to database for validation");
+    return 0;
+}
+
+/* ─── tpsvrdone ────────────────────────────────────────────────────────── */
+
+void tpsvrdone(void)
+{
+    EXEC SQL COMMIT WORK RELEASE;
+    userlog("tpsvrdone: Validation server shutdown");
+}
+
+/* ─── Validation Rules ───────────────────────────────────────────────────
+ *
+ * In production Tuxedo batch systems, validation logic is embedded
+ * directly in the Pro*C code for performance. Each rule has a specific
+ * business purpose:
+ *
+ *   R1: title must not be empty
+ *   R2: body must not be empty
+ *   R3: body must be at least 20 characters (reject spam/test data)
+ */
+
+static int validate_record(int post_id, int user_id,
+                           const char *title, const char *body,
+                           char *error_reason, int max_reason_len)
+{
+    if (!title || strlen(title) == 0) {
+        snprintf(error_reason, max_reason_len, "R1: empty title");
+        return 0;
+    }
+    if (!body || strlen(body) == 0) {
+        snprintf(error_reason, max_reason_len, "R2: empty body");
+        return 0;
+    }
+    if (strlen(body) < 20) {
+        snprintf(error_reason, max_reason_len, "R3: body too short (%zu chars)",
+                 strlen(body));
+        return 0;
+    }
+    return 1;  /* valid */
+}
+
+/* ─── BATCH_VALIDATE Service ───────────────────────────────────────────── */
+
+void BATCH_VALIDATE(TPSVCINFO *rqst)
+{
+    char error_reason[256];
+    userlog("BATCH_VALIDATE: Starting validation. rqst->data='%s'", rqst->data);
+
+    /* Parse batch_id from input */
+    h_batch_id = atoi(rqst->data ? rqst->data : "0");
+    if (h_batch_id == 0) {
+        /* Use most recent batch */
+        EXEC SQL SELECT MAX(ingest_batch_id) INTO :h_batch_id
+            FROM posts_staging;
+    }
+
+    userlog("BATCH_VALIDATE: Validating batch_id=%d", h_batch_id);
+
+    /* Reset counters */
+    h_valid_count = 0;
+    h_invalid_count = 0;
+    h_empty_title_count = 0;
+    h_empty_body_count = 0;
+    h_short_body_count = 0;
+
+    /* ── Main validation loop ──
+     * Uses cursor fetch pattern common in Tuxedo batch services.
+     * In Oracle, this would use EXEC SQL FETCH c_staging INTO :hv1, :hv2;
+     * For large batches, array fetch (FETCH ... INTO :arr1, :arr2) is preferred.
+     */
+
+    EXEC SQL WHENEVER SQLERROR GOTO validate_error;
+
+    EXEC SQL OPEN c_staging;
+
+    for (;;) {
+        EXEC SQL FETCH c_staging INTO :h_post_id, :h_user_id, :h_title, :h_body;
+
+        if (sqlca.sqlcode == 100) {
+            /* NO DATA FOUND — cursor exhausted */
+            break;
+        }
+
+        if (sqlca.sqlcode != 0) {
+            userlog("BATCH_VALIDATE: FETCH error. sqlcode=%ld", sqlca.sqlcode);
+            goto validate_error;
+        }
+
+        /* Run validation rules */
+        int valid = validate_record(h_post_id, h_user_id,
+                                     h_title, h_body,
+                                     error_reason, sizeof(error_reason));
+
+        if (valid) {
+            h_valid_count++;
+            /* Mark as validated in staging */
+            EXEC SQL UPDATE posts_staging
+                SET ingest_status = 'VALIDATED'
+                WHERE id = :h_post_id;
+        } else {
+            h_invalid_count++;
+            /* Track failure reason */
+            if (strstr(error_reason, "R1")) h_empty_title_count++;
+            if (strstr(error_reason, "R2")) h_empty_body_count++;
+            if (strstr(error_reason, "R3")) h_short_body_count++;
+
+            /* Mark as error in staging */
+            EXEC SQL UPDATE posts_staging
+                SET ingest_status = 'ERROR'
+                WHERE id = :h_post_id;
+
+            userlog("VALIDATE FAIL: post_id=%d, reason=%s",
+                    h_post_id, error_reason);
+        }
+
+        /* Commit every 200 rows to keep transaction log manageable */
+        if ((h_valid_count + h_invalid_count) % 200 == 0) {
+            EXEC SQL COMMIT;
+        }
+    }
+
+    EXEC SQL CLOSE c_staging;
+    EXEC SQL COMMIT;
+
+    /* ── Log results ── */
+    int total = h_valid_count + h_invalid_count;
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed)
+        VALUES ('BATCH_VALIDATE', 'SUCCESS', :total);
+
+    /* ── Return validation summary ── */
+    snprintf(h_status_msg, sizeof(h_status_msg),
+             "OK|total=%d|valid=%d|invalid=%d|empty_title=%d|"
+             "empty_body=%d|short_body=%d|batch_id=%d",
+             total, h_valid_count, h_invalid_count,
+             h_empty_title_count, h_empty_body_count,
+             h_short_body_count, h_batch_id);
+
+    userlog("BATCH_VALIDATE: %s", h_status_msg);
+    tpreturn(TPSUCCESS, 0, h_status_msg, strlen(h_status_msg) + 1, 0);
+    return;
+
+validate_error:
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+    EXEC SQL CLOSE c_staging;
+    EXEC SQL ROLLBACK;
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed, error_message)
+        VALUES ('BATCH_VALIDATE', 'FAILED', :h_valid_count + :h_invalid_count, 'SQL error during validation');
+    snprintf(h_status_msg, sizeof(h_status_msg),
+             "FAIL|validated=%d|sqlcode=%ld", h_valid_count, sqlca.sqlcode);
+    tpreturn(TPFAIL, sqlca.sqlcode, h_status_msg, 0, 0);
+}

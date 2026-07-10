@@ -1,0 +1,65 @@
+#
+# UBBCONFIG - Tuxedo Batch Processing Configuration
+#
+# This is the equivalent of an Oracle Tuxedo UBBCONFIG file.
+# In production, tmloadcf compiles this into a binary TUXCONFIG
+# that tmboot reads to start the system.
+#
+# For this simulation, the service dispatch is handled in
+# batch_orchestrator.c, but this file documents the expected
+# topology.
+#
+
+*RESOURCES
+IPCKEY          77777
+DOMAINID        BATCHAPP
+MASTER          SITE1
+MAXACCESSERS    50
+MAXSERVERS      30
+MAXSERVICES     100
+MODEL           SHM
+LDBAL           Y
+
+*MACHINES
+DEFAULT:
+                APPDIR="/app/batchapp"
+                TUXCONFIG="/app/batchapp/tuxconfig"
+                TUXDIR="/opt/tuxedo"
+localhost       LMID=SITE1
+
+*GROUPS
+# Batch ingestion group - non-XA (SQLite, no 2PC needed)
+GRP_INGEST      LMID=SITE1  GRPNO=1  OPENINFO=NONE
+
+# Batch processing group
+GRP_PROCESS     LMID=SITE1  GRPNO=2  OPENINFO=NONE
+
+# Reporting group
+GRP_REPORT      LMID=SITE1  GRPNO=3  OPENINFO=NONE
+
+*SERVERS
+DEFAULT:
+                RESTART=Y  MAXGEN=5  GRACE=3600
+                CLOPT="-A"
+
+# Ingestion server - single instance (not thread-safe with SQLite)
+batch_ingest    SRVGRP=GRP_INGEST  SRVID=1
+                MIN=1  MAX=1
+
+# Validation server - single instance
+batch_validate  SRVGRP=GRP_PROCESS  SRVID=10
+                MIN=1  MAX=1
+
+# Transform server - chained via tpforward to REPORT
+batch_transform SRVGRP=GRP_PROCESS  SRVID=20
+                MIN=1  MAX=1
+
+# Report server
+batch_report    SRVGRP=GRP_REPORT   SRVID=30
+                MIN=1  MAX=1
+
+*SERVICES
+BATCH_INGEST
+BATCH_VALIDATE
+BATCH_TRANSFORM
+BATCH_REPORT

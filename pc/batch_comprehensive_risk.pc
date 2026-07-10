@@ -1,0 +1,1464 @@
+/*
+ * batch_comprehensive_risk.pc - Tuxedo Comprehensive Risk Assessment Service
+ *
+ * Flagship service combining all Pro*C patterns with FML buffer I/O.
+ * Simulates ICICI Securities' portfolio risk assessment for institutional
+ * and HNI clients, covering VAR, stress testing, margin adequacy,
+ * concentration risk, regulatory compliance, and internal API chaining.
+ *
+ * Service: BATCH_COMPREHENSIVE_RISK
+ * Pattern: Multi-phase conditional execution with FML typed buffers
+ * Complexity: COMPLEX (~3000+ lines Pro*C)
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+#include <atmi.h>
+#include <userlog.h>
+
+EXEC SQL INCLUDE SQLCA;
+
+/* ─── Risk grade thresholds ────────────────────────────────────────────── */
+
+#define VAR_THRESHOLD_HIGH      0.15
+#define VAR_THRESHOLD_CRITICAL  0.25
+#define CONC_THRESHOLD_STOCK    0.20
+#define CONC_THRESHOLD_SECTOR   0.40
+#define MARGIN_DEFICIT_THRESHOLD 0.10
+
+/* ─── Host Variable Declarations ──────────────────────────────────────── */
+
+EXEC SQL BEGIN DECLARE SECTION;
+    VARCHAR uid[30];
+    VARCHAR pwd[30];
+
+    /* ── Input fields (from FML) ── */
+    char    h_client_code[32];
+    char    h_risk_date[16];
+    int     h_scenario_flag;
+    char    h_client_segment[32];
+    char    h_portfolio_type[32];
+    char    h_request_id[64];
+
+    /* ── User/profile data ── */
+    int     h_user_id;
+    char    h_full_name[128];
+    char    h_segment[32];
+    char    h_risk_profile[32];
+    char    h_account_status[16];
+    char    h_kyc_status[16];
+    double  h_annual_income;
+    double  h_net_worth;
+
+    /* ── Portfolio cursor host vars ── */
+    char    h_pf_ticker[32];
+    int     h_pf_quantity;
+    double  h_pf_avg_price;
+    double  h_pf_invested;
+    char    h_pf_pledge_status[16];
+    double  h_current_price;
+    char    h_company_name[128];
+    char    h_sector[64];
+    double  h_beta;
+    double  h_market_cap;
+    double  h_pe_ratio;
+    double  h_avg_daily_volume;
+
+    /* ── Price history cursor host vars ── */
+    char    h_ph_ticker[32];
+    char    h_ph_date[16];
+    double  h_ph_close;
+
+    /* ── Transaction cursor host vars ── */
+    char    h_txn_ticker[32];
+    char    h_txn_type[8];
+    int     h_txn_quantity;
+    double  h_txn_price;
+    char    h_txn_date[16];
+
+    /* ── Sector concentration cursor host vars ── */
+    char    h_sc_sector[64];
+    double  h_sc_total_value;
+    int     h_sc_stock_count;
+
+    /* ── Margin cursor host vars ── */
+    char    h_mg_ticker[32];
+    double  h_mg_market_value;
+    double  h_mg_pledged_value;
+    char    h_mg_portfolio_type[16];
+
+    /* ── Aggregation accumulators ── */
+    double  h_total_portfolio_value;
+    double  h_total_invested_value;
+    int     h_total_positions;
+    double  h_weighted_beta_sum;
+    double  h_portfolio_beta;
+    int     h_position_count;
+
+    /* ── Risk metrics ── */
+    double  h_var_95;
+    double  h_var_99;
+    double  h_max_drawdown;
+    double  h_sharpe_ratio;
+    double  h_beta_weighted;
+    int     h_drawdown_days;
+
+    /* ── Stress test results ── */
+    double  h_stress_loss_pct;
+    double  h_stress_loss_pct_2;
+    double  h_stress_loss_pct_3;
+
+    /* ── Margin & exposure ── */
+    double  h_margin_deficit;
+    double  h_total_exposure;
+    double  h_hedge_effectiveness;
+
+    /* ── Concentration & liquidity ── */
+    double  h_concentration_risk;
+    double  h_liquidity_score;
+    double  h_max_stock_concentration;
+    char    h_max_stock_ticker[32];
+    double  h_max_sector_concentration;
+    char    h_max_sector_name[64];
+    double  h_days_to_liquidate_min;
+
+    /* ── Compliance & output ── */
+    char    h_risk_grade[16];
+    char    h_action_required[256];
+    char    h_sector_exposure_json[4096];
+    char    h_status_msg[1024];
+    int     h_rows_processed;
+    int     h_phase_errors;
+
+    /* ── Computed scalars ── */
+    double  h_risk_free_rate;
+    int     h_return_count;
+    double  h_mean_return;
+    double  h_std_return;
+    int     h_compliance_flags;
+    int     h_positions_in_margin;
+EXEC SQL END DECLARE SECTION;
+
+/* ─── Daily return storage for VAR/drawdown ──────────────────────────── */
+
+#define MAX_RETURNS 252
+static double daily_returns[MAX_RETURNS];
+static int    return_idx = 0;
+
+/* ─── Per-position data for risk calculations ─────────────────────────── */
+
+#define MAX_POSITIONS 100
+static struct {
+    char   ticker[32];
+    char   sector[64];
+    int    quantity;
+    double avg_price;
+    double current_price;
+    double beta;
+    double weight;
+    double market_value;
+    double avg_daily_volume;
+} positions[MAX_POSITIONS];
+static int position_count = 0;
+
+/* ─── Error Handler ──────────────────────────────────────────────────── */
+
+static void sql_error(char *msg)
+{
+    userlog("[FATAL] %s: sqlcode=%ld, sqlerrm=%.*s",
+            msg, sqlca.sqlcode, sqlca.sqlerrm.sqlerrml, sqlca.sqlerrm.sqlerrmc);
+    EXEC SQL ROLLBACK;
+}
+
+/* ─── Helper: quick sort comparator for doubles ──────────────────────── */
+
+static int double_cmp(const void *a, const void *b)
+{
+    double da = *(const double *)a;
+    double db = *(const double *)b;
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return 0;
+}
+
+/* ─── Helper: min of two doubles ──────────────────────────────────────── */
+
+static double dmin(double a, double b) { return a < b ? a : b; }
+
+/* ─── Helper: max of two doubles ──────────────────────────────────────── */
+
+static double dmax(double a, double b) { return a > b ? a : b; }
+
+/* ─── tpsvrinit: Server Boot ─────────────────────────────────────────── */
+
+int tpsvrinit(int argc, char *argv[])
+{
+    (void)argc; (void)argv;
+    userlog("tpsvrinit: Initializing BATCH_COMPREHENSIVE_RISK server");
+
+    strcpy((char *)uid.arr, "batch_user");
+    uid.len = strlen((char *)uid.arr);
+    strcpy((char *)pwd.arr, "batch_pass");
+    pwd.len = strlen((char *)pwd.arr);
+
+    EXEC SQL WHENEVER SQLERROR DO sql_error("tpsvrinit CONNECT");
+    EXEC SQL CONNECT :uid IDENTIFIED BY :pwd;
+
+    if (sqlca.sqlcode != 0) {
+        userlog("tpsvrinit: CONNECT failed. sqlcode=%ld", sqlca.sqlcode);
+        return -1;
+    }
+
+    userlog("tpsvrinit: BATCH_COMPREHENSIVE_RISK ready. FML buffers supported.");
+    return 0;
+}
+
+/* ─── tpsvrdone: Server Shutdown ──────────────────────────────────────── */
+
+void tpsvrdone(void)
+{
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+    EXEC SQL COMMIT WORK RELEASE;
+    userlog("tpsvrdone: BATCH_COMPREHENSIVE_RISK shut down. "
+            "Total phases executed: %d", h_rows_processed);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+ * BATCH_COMPREHENSIVE_RISK — Main Service Entry Point
+ *
+ * Input:  FML buffer with FLD_CLIENT_CODE, FLD_RISK_DATE, FLD_SCENARIO_FLAG,
+ *         FLD_CLIENT_SEGMENT, FLD_PORTFOLIO_TYPE, FLD_REQUEST_ID
+ * Output: FML buffer with 16 risk metrics fields
+ * ═══════════════════════════════════════════════════════════════════════ */
+
+void BATCH_COMPREHENSIVE_RISK(TPSVCINFO *rqst)
+{
+    userlog("══════ BATCH_COMPREHENSIVE_RISK: Starting risk assessment ══════");
+
+    /* ── Init locals ── */
+    h_total_portfolio_value = 0.0;
+    h_total_invested_value  = 0.0;
+    h_total_positions       = 0;
+    h_weighted_beta_sum     = 0.0;
+    h_portfolio_beta        = 0.0;
+    position_count          = 0;
+    return_idx              = 0;
+    h_rows_processed        = 0;
+    h_phase_errors          = 0;
+    h_var_95                = 0.0;
+    h_var_99                = 0.0;
+    h_max_drawdown          = 0.0;
+    h_sharpe_ratio          = 0.0;
+    h_beta_weighted         = 0.0;
+    h_stress_loss_pct       = 0.0;
+    h_stress_loss_pct_2     = 0.0;
+    h_stress_loss_pct_3     = 0.0;
+    h_margin_deficit        = 0.0;
+    h_total_exposure        = 0.0;
+    h_hedge_effectiveness   = 0.0;
+    h_concentration_risk    = 0.0;
+    h_liquidity_score       = 0.0;
+    h_max_stock_concentration = 0.0;
+    h_max_sector_concentration = 0.0;
+    h_days_to_liquidate_min = 9999.0;
+    h_compliance_flags      = 0;
+    h_positions_in_margin   = 0;
+    h_risk_free_rate        = 0.065;
+    h_return_count          = 0;
+    h_mean_return           = 0.0;
+    h_std_return            = 0.0;
+    memset(h_max_stock_ticker, 0, sizeof(h_max_stock_ticker));
+    memset(h_max_sector_name, 0, sizeof(h_max_sector_name));
+    memset(h_risk_grade, 0, sizeof(h_risk_grade));
+    memset(h_action_required, 0, sizeof(h_action_required));
+    memset(h_sector_exposure_json, 0, sizeof(h_sector_exposure_json));
+    memset(h_status_msg, 0, sizeof(h_status_msg));
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * PHASE 1: Parse FML Input
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    userlog("── Phase 1: Parse FML Input ──");
+
+    {
+        FML_BUF *inbuf = (FML_BUF *)rqst->data;
+        int len = 0;
+
+        if (!inbuf || inbuf->buftype != FML) {
+            userlog("PHASE 1: No FML input buffer — using defaults");
+            strcpy(h_client_code, "DEFAULT");
+            strcpy(h_risk_date, "2026-07-07");
+            h_scenario_flag = SF_DEFAULT;
+            strcpy(h_client_segment, "EQUITY");
+            strcpy(h_portfolio_type, "DELIVERY");
+            strcpy(h_request_id, "REQ-DEFAULT-001");
+        } else {
+            len = sizeof(h_client_code);
+            if (Fget(inbuf, FLD_CLIENT_CODE, 0, h_client_code, &len) != 0)
+                strcpy(h_client_code, "DEFAULT");
+
+            len = sizeof(h_risk_date);
+            if (Fget(inbuf, FLD_RISK_DATE, 0, h_risk_date, &len) != 0)
+                strcpy(h_risk_date, "2026-07-07");
+
+            len = sizeof(int);
+            if (Fget(inbuf, FLD_SCENARIO_FLAG, 0, &h_scenario_flag, &len) != 0)
+                h_scenario_flag = SF_DEFAULT;
+
+            len = sizeof(h_client_segment);
+            if (Fget(inbuf, FLD_CLIENT_SEGMENT, 0, h_client_segment, &len) != 0)
+                strcpy(h_client_segment, "EQUITY");
+
+            len = sizeof(h_portfolio_type);
+            if (Fget(inbuf, FLD_PORTFOLIO_TYPE, 0, h_portfolio_type, &len) != 0)
+                strcpy(h_portfolio_type, "DELIVERY");
+
+            len = sizeof(h_request_id);
+            if (Fget(inbuf, FLD_REQUEST_ID, 0, h_request_id, &len) != 0)
+                strcpy(h_request_id, "REQ-FML-001");
+
+            userlog("PHASE 1: client=%s, date=%s, flags=0x%02X, segment=%s",
+                    h_client_code, h_risk_date, h_scenario_flag, h_client_segment);
+        }
+    }
+
+    if (h_scenario_flag & SF_DEBUG) {
+        userlog("DEBUG: FML parse complete. request_id=%s, portfolio_type=%s",
+                h_request_id, h_portfolio_type);
+    }
+
+    h_rows_processed++;
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * PHASE 2: Data Gathering (always runs)
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    userlog("── Phase 2: Data Gathering ──");
+    EXEC SQL WHENEVER SQLERROR GOTO phase2_error;
+
+    /* 2a: Look up user by client code */
+    {
+        EXEC SQL SELECT user_id, full_name, segment, risk_profile,
+                        account_status, kyc_status, annual_income, net_worth
+                 INTO :h_user_id, :h_full_name, :h_segment, :h_risk_profile,
+                      :h_account_status, :h_kyc_status, :h_annual_income, :h_net_worth
+                 FROM users
+                 WHERE client_code = :h_client_code;
+
+        if (sqlca.sqlcode == 100) {
+            userlog("PHASE 2: Client '%s' not found — using synthetic data",
+                    h_client_code);
+            h_user_id = 9999;
+            strcpy(h_full_name, "Synthetic Client");
+            strcpy(h_segment, h_client_segment);
+            strcpy(h_risk_profile, "MODERATE");
+            strcpy(h_account_status, "ACTIVE");
+            strcpy(h_kyc_status, "VERIFIED");
+            h_annual_income = 5000000.0;
+            h_net_worth = 25000000.0;
+        }
+    }
+
+    userlog("PHASE 2: User=%s (id=%d), segment=%s, risk=%s, kyc=%s",
+            h_full_name, h_user_id, h_segment, h_risk_profile, h_kyc_status);
+
+    /* 2b: Cursor — portfolio positions with fundamentals (if user exists) */
+    EXEC SQL DECLARE c_portfolio_fund CURSOR FOR
+        SELECT up.ticker, up.quantity, up.avg_buy_price,
+               up.invested_amount, up.pledge_status,
+               COALESCE(sf.current_price, 0),
+               COALESCE(sf.company_name, 'Unknown'),
+               COALESCE(sf.sector, 'UNCLASSIFIED'),
+               COALESCE(sf.beta, 1.0),
+               COALESCE(sf.market_cap_crore, 0)
+        FROM user_portfolios up
+        LEFT JOIN stock_fundamentals sf ON up.ticker = sf.ticker
+        WHERE up.user_id = :h_user_id
+          AND up.portfolio_type = :h_portfolio_type;
+
+    EXEC SQL OPEN c_portfolio_fund;
+
+    position_count = 0;
+    while (sqlca.sqlcode == 0 && position_count < MAX_POSITIONS) {
+        EXEC SQL FETCH c_portfolio_fund
+            INTO :h_pf_ticker, :h_pf_quantity, :h_pf_avg_price,
+                 :h_pf_invested, :h_pf_pledge_status,
+                 :h_current_price, :h_company_name, :h_sector,
+                 :h_beta, :h_market_cap;
+
+        if (sqlca.sqlcode == 100) break;
+        if (sqlca.sqlcode != 0) {
+            userlog("PHASE 2: FETCH error on portfolio cursor: sqlcode=%ld",
+                    sqlca.sqlcode);
+            h_phase_errors++;
+            break;
+        }
+
+        if (h_pf_quantity <= 0 || h_current_price <= 0.0) {
+            userlog("PHASE 2: Skipping %s (qty=%d, price=%.2f)",
+                    h_pf_ticker, h_pf_quantity, h_current_price);
+            continue;
+        }
+
+        double mkt_val = (double)h_pf_quantity * h_current_price;
+
+        /* Store in positions array */
+        strncpy(positions[position_count].ticker, h_pf_ticker, 31);
+        strncpy(positions[position_count].sector, h_sector, 63);
+        positions[position_count].quantity         = h_pf_quantity;
+        positions[position_count].avg_price        = h_pf_avg_price;
+        positions[position_count].current_price    = h_current_price;
+        positions[position_count].beta             = h_beta;
+        positions[position_count].market_value     = mkt_val;
+        positions[position_count].avg_daily_volume = 50000.0; /* default */
+
+        h_total_portfolio_value += mkt_val;
+        h_total_invested_value  += h_pf_invested;
+        position_count++;
+
+        if (h_scenario_flag & SF_DEBUG) {
+            userlog("DEBUG: pos[%d] %s: qty=%d, price=%.2f, mkt=%.2f, beta=%.2f, sector=%s",
+                    position_count - 1, h_pf_ticker, h_pf_quantity,
+                    h_current_price, mkt_val, h_beta, h_sector);
+        }
+    }
+    EXEC SQL CLOSE c_portfolio_fund;
+
+    userlog("PHASE 2: Portfolio scan complete. %d positions, "
+            "total_value=%.2f, invested=%.2f",
+            position_count, h_total_portfolio_value, h_total_invested_value);
+
+    /* If no portfolio found via DB, create synthetic positions for demo */
+    if (position_count == 0) {
+        userlog("PHASE 2: No DB portfolio — generating synthetic positions");
+
+        struct { char *ticker; char *sector; int qty; double price; double beta; } synth[] = {
+            {"RELIANCE",    "OIL_AND_GAS",      500,  2850.00, 0.95},
+            {"TCS",         "IT",               300,  4120.00, 0.72},
+            {"HDFCBANK",    "BANKING",          800,  1680.00, 1.12},
+            {"INFY",        "IT",               600,  1520.00, 0.68},
+            {"ITC",         "FMCG",            1200,   480.00, 0.55},
+            {"BHARTIARTL",  "TELECOM",          400,  1350.00, 0.88},
+            {"SUNPHARMA",   "PHARMA",           350,  1180.00, 0.62},
+            {"LT",          "INFRASTRUCTURE",    250,  3100.00, 1.25},
+            {"MARUTI",      "AUTO",             150, 12500.00, 1.05},
+            {"SBIN",        "BANKING",           900,   620.00, 1.35},
+            {"HINDUNILVR",  "FMCG",             450,  2650.00, 0.48},
+            {"ICICIBANK",   "BANKING",           700,  1050.00, 1.18},
+            {"WIPRO",       "IT",                500,   470.00, 0.75},
+            {"TITAN",       "CONSUMER",          280,  3400.00, 0.82},
+            {"ASIANPAINT",  "CONSUMER",          320,  3200.00, 0.59},
+        };
+        int synth_count = 15;
+
+        for (int i = 0; i < synth_count && position_count < MAX_POSITIONS; i++) {
+            double mkt_val = (double)synth[i].qty * synth[i].price;
+            strncpy(positions[position_count].ticker, synth[i].ticker, 31);
+            strncpy(positions[position_count].sector, synth[i].sector, 63);
+            positions[position_count].quantity      = synth[i].qty;
+            positions[position_count].avg_price     = synth[i].price * 0.9;
+            positions[position_count].current_price = synth[i].price;
+            positions[position_count].beta          = synth[i].beta;
+            positions[position_count].market_value  = mkt_val;
+            positions[position_count].avg_daily_volume = 50000.0;
+            h_total_portfolio_value += mkt_val;
+            h_total_invested_value  += synth[i].qty * synth[i].price * 0.9;
+            position_count++;
+        }
+        userlog("PHASE 2: Generated %d synthetic positions", position_count);
+    }
+
+    /* Compute position weights and weighted beta */
+    for (int i = 0; i < position_count; i++) {
+        positions[i].weight = positions[i].market_value / h_total_portfolio_value;
+        h_weighted_beta_sum += positions[i].weight * positions[i].beta;
+    }
+    h_portfolio_beta = h_weighted_beta_sum;
+    h_total_positions = position_count;
+
+    /* 2c: Set default average daily volume per position */
+    {
+        for (int i = 0; i < position_count; i++) {
+            /* Use a temp variable the preprocessor can parse */
+            char vol_ticker[32];
+            strncpy(vol_ticker, positions[i].ticker, 31);
+            vol_ticker[31] = '\0';
+
+            EXEC SQL SELECT COALESCE(AVG(volume), 50000)
+                     INTO :h_avg_daily_volume
+                     FROM eod_prices
+                     WHERE ticker = :vol_ticker
+                       AND date >= DATE(:h_risk_date, '-60 days');
+
+            if (sqlca.sqlcode == 0 && h_avg_daily_volume > 0) {
+                positions[i].avg_daily_volume = h_avg_daily_volume;
+            } else {
+                positions[i].avg_daily_volume = 50000.0;
+            }
+        }
+    }
+
+    /* 2d: Cursor — Price history for daily return computation */
+    {
+        /* We process each position's ticker and fetch price history */
+        char first_ticker[32];
+        if (position_count > 0) {
+            strncpy(first_ticker, positions[0].ticker, 31);
+        } else {
+            strcpy(first_ticker, "RELIANCE");
+        }
+
+        EXEC SQL DECLARE c_price_history CURSOR FOR
+            SELECT ticker, date, close
+            FROM eod_prices
+            WHERE ticker = :first_ticker
+              AND date >= DATE(:h_risk_date, '-252 days')
+            ORDER BY date ASC;
+
+        /* Re-open per ticker to fetch history — for demo we use first ticker */
+        EXEC SQL OPEN c_price_history;
+
+        double prev_close = -1.0;
+        return_idx = 0;
+        while (return_idx < MAX_RETURNS) {
+            EXEC SQL FETCH c_price_history
+                INTO :h_ph_ticker, :h_ph_date, :h_ph_close;
+
+            if (sqlca.sqlcode == 100) break;
+            if (sqlca.sqlcode != 0) {
+                h_phase_errors++;
+                break;
+            }
+
+            if (prev_close > 0.0 && h_ph_close > 0.0) {
+                double ret = (h_ph_close - prev_close) / prev_close;
+                daily_returns[return_idx++] = ret;
+            }
+            prev_close = h_ph_close;
+        }
+        EXEC SQL CLOSE c_price_history;
+
+        h_return_count = return_idx;
+        userlog("PHASE 2: Collected %d daily returns from price history", h_return_count);
+    }
+
+    /* If no price history, generate synthetic returns */
+    if (h_return_count < 20) {
+        userlog("PHASE 2: Insufficient price history — generating synthetic returns");
+        h_return_count = 252;
+        srand(42);  /* fixed seed for reproducible output */
+        for (int i = 0; i < h_return_count; i++) {
+            /* Normal-ish distribution with slight positive drift */
+            double u1 = (double)rand() / RAND_MAX;
+            double u2 = (double)rand() / RAND_MAX;
+            double z = sqrt(-2.0 * log(u1 + 0.0001)) * cos(2.0 * 3.1415926535 * u2);
+            daily_returns[i] = 0.0004 + z * 0.015;  /* mean ~0.04%, std ~1.5% */
+        }
+    }
+
+    /* 2e: Cursor — Transactions for hedge effectiveness */
+    {
+        EXEC SQL DECLARE c_transactions CURSOR FOR
+            SELECT ticker, txn_type, quantity, price, txn_date
+            FROM user_transactions
+            WHERE user_id = :h_user_id
+              AND txn_date >= DATE(:h_risk_date, '-90 days')
+            ORDER BY txn_date DESC;
+
+        EXEC SQL OPEN c_transactions;
+
+        int buy_count = 0, sell_count = 0;
+        double total_buy = 0.0, total_sell = 0.0;
+
+        while (1) {
+            EXEC SQL FETCH c_transactions
+                INTO :h_txn_ticker, :h_txn_type, :h_txn_quantity,
+                     :h_txn_price, :h_txn_date;
+
+            if (sqlca.sqlcode == 100) break;
+            if (sqlca.sqlcode != 0) break;
+
+            double txn_val = (double)h_txn_quantity * h_txn_price;
+            if (strcmp(h_txn_type, "BUY") == 0) {
+                buy_count++;
+                total_buy += txn_val;
+            } else if (strcmp(h_txn_type, "SELL") == 0) {
+                sell_count++;
+                total_sell += txn_val;
+            }
+        }
+        EXEC SQL CLOSE c_transactions;
+
+        if (total_buy > 0.0) {
+            h_hedge_effectiveness = total_sell / total_buy;
+        } else {
+            h_hedge_effectiveness = 0.0;
+        }
+        userlog("PHASE 2: Transactions — %d buys (%.0f), %d sells (%.0f), "
+                "hedge_eff=%.3f", buy_count, total_buy, sell_count, total_sell,
+                h_hedge_effectiveness);
+    }
+
+    /* 2f: Cursor — Sector concentration GROUP BY */
+    {
+        EXEC SQL DECLARE c_sector_conc CURSOR FOR
+            SELECT COALESCE(sf.sector, 'UNCLASSIFIED'),
+                   SUM(up.quantity * COALESCE(sf.current_price, 0)),
+                   COUNT(DISTINCT up.ticker)
+            FROM user_portfolios up
+            LEFT JOIN stock_fundamentals sf ON up.ticker = sf.ticker
+            WHERE up.user_id = :h_user_id
+              AND up.portfolio_type = :h_portfolio_type
+            GROUP BY sf.sector
+            ORDER BY SUM(up.quantity * COALESCE(sf.current_price, 0)) DESC;
+
+        EXEC SQL OPEN c_sector_conc;
+
+        char json_buf[4096];
+        int json_pos = 0;
+        json_pos += snprintf(json_buf + json_pos, sizeof(json_buf) - json_pos, "[");
+
+        int first_sector = 1;
+        while (1) {
+            EXEC SQL FETCH c_sector_conc
+                INTO :h_sc_sector, :h_sc_total_value, :h_sc_stock_count;
+
+            if (sqlca.sqlcode == 100) break;
+            if (sqlca.sqlcode != 0) break;
+
+            double sector_pct = h_total_portfolio_value > 0.0
+                ? h_sc_total_value / h_total_portfolio_value : 0.0;
+
+            if (sector_pct > h_max_sector_concentration) {
+                h_max_sector_concentration = sector_pct;
+                strncpy(h_max_sector_name, h_sc_sector, 63);
+            }
+
+            if (!first_sector) json_pos += snprintf(json_buf + json_pos,
+                sizeof(json_buf) - json_pos, ",");
+            first_sector = 0;
+
+            json_pos += snprintf(json_buf + json_pos, sizeof(json_buf) - json_pos,
+                "{\"sector\":\"%s\",\"value\":%.2f,\"pct\":%.4f,\"stocks\":%d}",
+                h_sc_sector, h_sc_total_value, sector_pct, h_sc_stock_count);
+
+            if (json_pos >= (int)sizeof(json_buf) - 256) break;
+        }
+        EXEC SQL CLOSE c_sector_conc;
+
+        json_pos += snprintf(json_buf + json_pos, sizeof(json_buf) - json_pos, "]");
+        strncpy(h_sector_exposure_json, json_buf, sizeof(h_sector_exposure_json) - 1);
+
+        userlog("PHASE 2: Max sector concentration: %s at %.1f%%",
+                h_max_sector_name, h_max_sector_concentration * 100.0);
+        userlog("PHASE 2: Sector exposure JSON: %s", h_sector_exposure_json);
+    }
+
+    /* 2g: Cursor — Margin/pledge status GROUP BY */
+    {
+        EXEC SQL DECLARE c_margin_status CURSOR FOR
+            SELECT up.ticker,
+                   up.quantity * COALESCE(sf.current_price, 0),
+                   CASE WHEN up.pledge_status = 'PLEDGED'
+                        THEN up.quantity * COALESCE(sf.current_price, 0) ELSE 0 END,
+                   up.portfolio_type
+            FROM user_portfolios up
+            LEFT JOIN stock_fundamentals sf ON up.ticker = sf.ticker
+            WHERE up.user_id = :h_user_id
+            ORDER BY up.portfolio_type;
+
+        EXEC SQL OPEN c_margin_status;
+
+        double total_pledged = 0.0;
+        double total_margin_positions = 0.0;
+
+        while (1) {
+            EXEC SQL FETCH c_margin_status
+                INTO :h_mg_ticker, :h_mg_market_value,
+                     :h_mg_pledged_value, :h_mg_portfolio_type;
+
+            if (sqlca.sqlcode == 100) break;
+            if (sqlca.sqlcode != 0) break;
+
+            if (strcmp(h_mg_portfolio_type, "MARGIN") == 0) {
+                total_margin_positions += h_mg_market_value;
+                h_positions_in_margin++;
+            }
+            total_pledged += h_mg_pledged_value;
+        }
+        EXEC SQL CLOSE c_margin_status;
+
+        userlog("PHASE 2: Margin positions=%d (value=%.0f), pledged=%.0f",
+                h_positions_in_margin, total_margin_positions, total_pledged);
+
+        h_total_exposure = h_total_portfolio_value;
+    }
+
+    /* Compute mean and std of returns for later phases */
+    {
+        double sum = 0.0, sum_sq = 0.0;
+        for (int i = 0; i < h_return_count; i++) {
+            sum += daily_returns[i];
+            sum_sq += daily_returns[i] * daily_returns[i];
+        }
+        h_mean_return = sum / (double)h_return_count;
+        double variance = (sum_sq / (double)h_return_count) - (h_mean_return * h_mean_return);
+        h_std_return = variance > 0.0 ? sqrt(variance) : 0.01;
+        userlog("PHASE 2: mean_return=%.6f, std_return=%.6f, count=%d",
+                h_mean_return, h_std_return, h_return_count);
+    }
+
+    h_rows_processed++;
+    goto phase2_done;
+
+phase2_error:
+    userlog("PHASE 2: SQL error — sqlcode=%ld", sqlca.sqlcode);
+    h_phase_errors++;
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+phase2_done:
+    userlog("── Phase 2 complete: %d positions, total_value=%.2f ──",
+            position_count, h_total_portfolio_value);
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * PHASE 3: Risk Metrics (SF_BASIC_RISK)
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    if (h_scenario_flag & SF_BASIC_RISK) {
+        userlog("── Phase 3: Risk Metrics ──");
+        EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+        /* 3a: Historical VaR from sorted returns */
+        if (h_return_count >= 20) {
+            qsort(daily_returns, h_return_count, sizeof(double), double_cmp);
+
+            int var95_idx = (int)(h_return_count * 0.05);
+            int var99_idx = (int)(h_return_count * 0.01);
+            if (var95_idx < 0) var95_idx = 0;
+            if (var99_idx < 0) var99_idx = 0;
+
+            h_var_95 = -daily_returns[var95_idx] * h_total_portfolio_value;
+            h_var_99 = -daily_returns[var99_idx] * h_total_portfolio_value;
+
+            userlog("PHASE 3: Historical VaR — 95%%=%.2f, 99%%=%.2f (from %d returns)",
+                    h_var_95, h_var_99, h_return_count);
+        }
+
+        /* 3b: Parametric VaR check */
+        {
+            double param_var_95 = (h_mean_return - 1.645 * h_std_return)
+                                  * h_total_portfolio_value;
+            double param_var_99 = (h_mean_return - 2.326 * h_std_return)
+                                  * h_total_portfolio_value;
+
+            /* Blend historical and parametric */
+            if (h_var_95 < 0.01) h_var_95 = -param_var_95;
+            if (h_var_99 < 0.01) h_var_99 = -param_var_99;
+
+            userlog("PHASE 3: Parametric VaR — 95%%=%.2f, 99%%=%.2f",
+                    param_var_95, param_var_99);
+        }
+
+        /* 3c: Weighted beta */
+        h_beta_weighted = h_portfolio_beta;
+        userlog("PHASE 3: Portfolio weighted beta = %.3f", h_beta_weighted);
+
+        /* 3d: Sharpe ratio */
+        {
+            double excess_return = h_mean_return * 252.0 - h_risk_free_rate;
+            double annualized_std = h_std_return * sqrt(252.0);
+            h_sharpe_ratio = annualized_std > 0.0
+                ? excess_return / annualized_std : 0.0;
+            userlog("PHASE 3: Sharpe ratio = %.3f (excess=%.4f, ann_std=%.4f)",
+                    h_sharpe_ratio, excess_return, annualized_std);
+        }
+
+        /* 3e: Max drawdown from cumulative returns */
+        {
+            double peak = 1.0;
+            double cum_return = 1.0;
+            h_max_drawdown = 0.0;
+
+            for (int i = 0; i < h_return_count; i++) {
+                cum_return *= (1.0 + daily_returns[i]);
+                if (cum_return > peak) {
+                    peak = cum_return;
+                }
+                double dd = (peak - cum_return) / peak;
+                if (dd > h_max_drawdown) {
+                    h_max_drawdown = dd;
+                }
+            }
+            userlog("PHASE 3: Max drawdown = %.2f%%", h_max_drawdown * 100.0);
+        }
+
+        /* 3f: Persist to risk_assessment_results (partial) */
+        EXEC SQL INSERT INTO risk_assessment_results
+            (request_id, client_code, risk_date, var_95, var_99,
+             max_drawdown, sharpe_ratio, beta_weighted, total_exposure)
+            VALUES (:h_request_id, :h_client_code, :h_risk_date,
+                    :h_var_95, :h_var_99, :h_max_drawdown,
+                    :h_sharpe_ratio, :h_beta_weighted, :h_total_exposure);
+
+        h_rows_processed++;
+    } else {
+        userlog("── Phase 3: SKIPPED (SF_BASIC_RISK not set) ──");
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * PHASE 4: Stress Testing (SF_STRESS_TEST)
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    if (h_scenario_flag & SF_STRESS_TEST) {
+        userlog("── Phase 4: Stress Testing ──");
+        EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+        /* Scenario 1: Market crash — equities drop 20% */
+        {
+            double crash_loss = 0.0;
+            for (int i = 0; i < position_count; i++) {
+                double loss = positions[i].market_value * 0.20;
+                /* High-beta stocks get hit harder in crash */
+                if (positions[i].beta > 1.2) {
+                    loss *= 1.25;
+                } else if (positions[i].beta > 1.5) {
+                    loss *= 1.50;
+                }
+                /* Defensive sectors get hit less */
+                if (strcmp(positions[i].sector, "FMCG") == 0 ||
+                    strcmp(positions[i].sector, "PHARMA") == 0) {
+                    loss *= 0.70;
+                }
+                crash_loss += loss;
+            }
+            h_stress_loss_pct = h_total_portfolio_value > 0.0
+                ? crash_loss / h_total_portfolio_value : 0.0;
+            userlog("PHASE 4: Scenario 1 (Market Crash -20%%) — loss=%.2f (%.1f%%)",
+                    crash_loss, h_stress_loss_pct * 100.0);
+        }
+
+        /* Scenario 2: Interest rate spike +200bps */
+        {
+            double rate_loss = 0.0;
+            for (int i = 0; i < position_count; i++) {
+                /* Rate-sensitive sectors: banking, financials, real estate */
+                double sensitivity = 0.0;
+                if (strcmp(positions[i].sector, "BANKING") == 0) {
+                    sensitivity = 0.08;
+                } else if (strcmp(positions[i].sector, "INFRASTRUCTURE") == 0) {
+                    sensitivity = 0.06;
+                } else if (strcmp(positions[i].sector, "AUTO") == 0) {
+                    sensitivity = 0.04;
+                } else if (positions[i].beta > 1.0) {
+                    sensitivity = 0.03;
+                } else {
+                    sensitivity = 0.02;
+                }
+                double loss = positions[i].market_value * sensitivity;
+                rate_loss += loss;
+            }
+            h_stress_loss_pct_2 = h_total_portfolio_value > 0.0
+                ? rate_loss / h_total_portfolio_value : 0.0;
+            userlog("PHASE 4: Scenario 2 (Rate Spike +200bps) — loss=%.2f (%.1f%%)",
+                    rate_loss, h_stress_loss_pct_2 * 100.0);
+        }
+
+        /* Scenario 3: Sector rotation — IT and Banking rotate out */
+        {
+            double rotation_loss = 0.0;
+            for (int i = 0; i < position_count; i++) {
+                double sector_hit = 0.0;
+                if (strcmp(positions[i].sector, "IT") == 0) {
+                    sector_hit = 0.12;
+                } else if (strcmp(positions[i].sector, "BANKING") == 0) {
+                    sector_hit = 0.10;
+                } else if (strcmp(positions[i].sector, "OIL_AND_GAS") == 0) {
+                    sector_hit = 0.08;
+                } else if (strcmp(positions[i].sector, "TELECOM") == 0) {
+                    sector_hit = 0.07;
+                } else {
+                    sector_hit = 0.03;
+                }
+                double loss = positions[i].market_value * sector_hit;
+                rotation_loss += loss;
+            }
+            h_stress_loss_pct_3 = h_total_portfolio_value > 0.0
+                ? rotation_loss / h_total_portfolio_value : 0.0;
+            userlog("PHASE 4: Scenario 3 (Sector Rotation) — loss=%.2f (%.1f%%)",
+                    rotation_loss, h_stress_loss_pct_3 * 100.0);
+        }
+
+        /* Stress test severity assessment */
+        {
+            double max_stress = h_stress_loss_pct;
+            if (h_stress_loss_pct_2 > max_stress) max_stress = h_stress_loss_pct_2;
+            if (h_stress_loss_pct_3 > max_stress) max_stress = h_stress_loss_pct_3;
+
+            if (max_stress > 0.30) {
+                userlog("PHASE 4: SEVERE stress vulnerability detected (max=%.1f%%)",
+                        max_stress * 100.0);
+            } else if (max_stress > 0.15) {
+                userlog("PHASE 4: MODERATE stress vulnerability (max=%.1f%%)",
+                        max_stress * 100.0);
+            } else {
+                userlog("PHASE 4: LOW stress vulnerability (max=%.1f%%)",
+                        max_stress * 100.0);
+            }
+        }
+
+        /* Update risk assessment with stress results */
+        EXEC SQL UPDATE risk_assessment_results
+            SET stress_loss_pct = :h_stress_loss_pct,
+                stress_loss_pct_2 = :h_stress_loss_pct_2,
+                stress_loss_pct_3 = :h_stress_loss_pct_3
+            WHERE request_id = :h_request_id
+              AND client_code = :h_client_code
+              AND risk_date = :h_risk_date;
+
+        h_rows_processed++;
+    } else {
+        userlog("── Phase 4: SKIPPED (SF_STRESS_TEST not set) ──");
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * PHASE 5: Margin & Exposure (SF_MARGIN)
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    if (h_scenario_flag & SF_MARGIN) {
+        userlog("── Phase 5: Margin & Exposure ──");
+        EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+        /* Determine margin rate based on risk profile */
+        double base_margin_rate = 0.25; /* default 25% */
+        {
+            if (strcmp(h_risk_profile, "CONSERVATIVE") == 0) {
+                base_margin_rate = 0.40;
+            } else if (strcmp(h_risk_profile, "MODERATE") == 0) {
+                base_margin_rate = 0.30;
+            } else if (strcmp(h_risk_profile, "AGGRESSIVE") == 0) {
+                base_margin_rate = 0.20;
+            }
+
+            /* Segment adjustments */
+            if (strcmp(h_segment, "FNO") == 0) {
+                base_margin_rate += 0.05;
+            } else if (strcmp(h_segment, "COMMODITY") == 0) {
+                base_margin_rate += 0.08;
+            }
+
+            /* Portfolio type adjustment */
+            if (strcmp(h_portfolio_type, "MARGIN") == 0) {
+                base_margin_rate += 0.05;
+            } else if (strcmp(h_portfolio_type, "INTRADAY") == 0) {
+                base_margin_rate += 0.10;
+            }
+
+            /* Net worth adjustment */
+            if (h_net_worth > 10000000.0) {
+                base_margin_rate -= 0.05;
+            } else if (h_net_worth < 1000000.0) {
+                base_margin_rate += 0.05;
+            }
+
+            /* Beta adjustment */
+            if (h_portfolio_beta > 1.5) {
+                base_margin_rate += 0.05;
+            } else if (h_portfolio_beta > 1.2) {
+                base_margin_rate += 0.03;
+            } else if (h_portfolio_beta < 0.7) {
+                base_margin_rate -= 0.03;
+            }
+
+            /* Clamp */
+            if (base_margin_rate < 0.10) base_margin_rate = 0.10;
+            if (base_margin_rate > 0.60) base_margin_rate = 0.60;
+        }
+
+        double required_margin = h_total_portfolio_value * base_margin_rate;
+        double available_margin = h_net_worth * 0.50; /* 50% of net worth */
+
+        h_margin_deficit = required_margin - available_margin;
+        if (h_margin_deficit < 0.0) h_margin_deficit = 0.0;
+
+        double margin_utilization = available_margin > 0.0
+            ? required_margin / available_margin : 1.0;
+
+        userlog("PHASE 5: margin_rate=%.0f%%, required=%.2f, available=%.2f, "
+                "deficit=%.2f, utilization=%.1f%%",
+                base_margin_rate * 100.0, required_margin, available_margin,
+                h_margin_deficit, margin_utilization * 100.0);
+
+        /* Concentration-based margin surcharge */
+        double conc_surcharge = 0.0;
+        {
+            /* Max single stock exposure */
+            for (int i = 0; i < position_count; i++) {
+                double stock_pct = positions[i].market_value / h_total_portfolio_value;
+                if (stock_pct > h_max_stock_concentration) {
+                    h_max_stock_concentration = stock_pct;
+                    strncpy(h_max_stock_ticker, positions[i].ticker, 31);
+                }
+                if (stock_pct > CONC_THRESHOLD_STOCK) {
+                    conc_surcharge += (stock_pct - CONC_THRESHOLD_STOCK) * 0.10;
+                }
+            }
+
+            if (conc_surcharge > 0.0) {
+                double conc_additional = h_total_portfolio_value * conc_surcharge;
+                h_margin_deficit += conc_additional;
+                userlog("PHASE 5: Concentration surcharge=%.2f (max_stock=%s at %.1f%%)",
+                        conc_additional, h_max_stock_ticker,
+                        h_max_stock_concentration * 100.0);
+            }
+        }
+
+        /* Update risk assessment */
+        EXEC SQL UPDATE risk_assessment_results
+            SET margin_deficit = :h_margin_deficit
+            WHERE request_id = :h_request_id
+              AND client_code = :h_client_code
+              AND risk_date = :h_risk_date;
+
+        h_rows_processed++;
+    } else {
+        userlog("── Phase 5: SKIPPED (SF_MARGIN not set) ──");
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * PHASE 6: Concentration & Liquidity (SF_CONCENTRATION)
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    if (h_scenario_flag & SF_CONCENTRATION) {
+        userlog("── Phase 6: Concentration & Liquidity ──");
+        EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+        /* 6a: Concentration risk score (0–100) */
+        {
+            double stock_conc_score = h_max_stock_concentration * 100.0;
+            double sector_conc_score = h_max_sector_concentration * 100.0;
+
+            /* Penalize if any single stock > 15% */
+            if (h_max_stock_concentration > 0.30) {
+                stock_conc_score += 30.0;
+            } else if (h_max_stock_concentration > 0.20) {
+                stock_conc_score += 15.0;
+            } else if (h_max_stock_concentration > 0.15) {
+                stock_conc_score += 5.0;
+            }
+
+            /* Penalize if any single sector > 50% */
+            if (h_max_sector_concentration > 0.60) {
+                sector_conc_score += 40.0;
+            } else if (h_max_sector_concentration > 0.50) {
+                sector_conc_score += 25.0;
+            } else if (h_max_sector_concentration > 0.40) {
+                sector_conc_score += 10.0;
+            }
+
+            /* Fewer positions = higher concentration risk */
+            if (position_count < 5) {
+                stock_conc_score += 20.0;
+            } else if (position_count < 10) {
+                stock_conc_score += 10.0;
+            } else if (position_count < 15) {
+                stock_conc_score += 5.0;
+            } else if (position_count >= 20) {
+                stock_conc_score -= 5.0;
+            }
+
+            h_concentration_risk = dmin(stock_conc_score + sector_conc_score, 100.0);
+            userlog("PHASE 6: Concentration risk=%.1f/100 (stock=%.1f, sector=%.1f, "
+                    "max_stock=%s@%.1f%%, max_sector=%s@%.1f%%)",
+                    h_concentration_risk, stock_conc_score, sector_conc_score,
+                    h_max_stock_ticker, h_max_stock_concentration * 100.0,
+                    h_max_sector_name, h_max_sector_concentration * 100.0);
+        }
+
+        /* 6b: Liquidity score (0–100, higher is better) */
+        {
+            double total_volume_days = 0.0;
+
+            for (int i = 0; i < position_count; i++) {
+                double daily_volume_val = positions[i].avg_daily_volume
+                                          * positions[i].current_price;
+                double days_to_liquidate = daily_volume_val > 0.0
+                    ? (positions[i].market_value * 0.10) / daily_volume_val
+                    : 5.0;
+
+                if (days_to_liquidate < h_days_to_liquidate_min) {
+                    h_days_to_liquidate_min = days_to_liquidate;
+                }
+                total_volume_days += days_to_liquidate;
+            }
+
+            double avg_days = position_count > 0
+                ? total_volume_days / position_count : 5.0;
+
+            /* Score: 100 if liquidatable in <1 day, 0 if >10 days */
+            h_liquidity_score = 100.0 - (avg_days * 10.0);
+            if (h_liquidity_score < 0.0) h_liquidity_score = 0.0;
+            if (h_liquidity_score > 100.0) h_liquidity_score = 100.0;
+
+            userlog("PHASE 6: Liquidity score=%.1f/100 (avg_days=%.1f, min_days=%.1f)",
+                    h_liquidity_score, avg_days, h_days_to_liquidate_min);
+        }
+
+        /* 6c: Concentration/liquidity warnings */
+        {
+            if (h_concentration_risk > 70.0) {
+                userlog("PHASE 6: HIGH concentration risk — diversification needed");
+            }
+            if (h_liquidity_score < 30.0) {
+                userlog("PHASE 6: LOW liquidity — position exit may impact prices");
+            }
+            if (h_max_stock_concentration > CONC_THRESHOLD_STOCK) {
+                userlog("PHASE 6: Stock %s exceeds single-stock limit of %.0f%%",
+                        h_max_stock_ticker, CONC_THRESHOLD_STOCK * 100.0);
+            }
+            if (h_max_sector_concentration > CONC_THRESHOLD_SECTOR) {
+                userlog("PHASE 6: Sector %s exceeds sector limit of %.0f%%",
+                        h_max_sector_name, CONC_THRESHOLD_SECTOR * 100.0);
+            }
+        }
+
+        /* Update risk assessment */
+        EXEC SQL UPDATE risk_assessment_results
+            SET concentration_risk = :h_concentration_risk,
+                liquidity_score = :h_liquidity_score
+            WHERE request_id = :h_request_id
+              AND client_code = :h_client_code
+              AND risk_date = :h_risk_date;
+
+        h_rows_processed++;
+    } else {
+        userlog("── Phase 6: SKIPPED (SF_CONCENTRATION not set) ──");
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * PHASE 7: Compliance (SF_COMPLIANCE)
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    if (h_scenario_flag & SF_COMPLIANCE) {
+        userlog("── Phase 7: Compliance ──");
+        EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+        /* 7a: KYC Check */
+        {
+            if (strcmp(h_kyc_status, "VERIFIED") != 0) {
+                h_compliance_flags |= 0x01;
+                userlog("PHASE 7: KYC NOT VERIFIED — flag set");
+            }
+
+            if (strcmp(h_account_status, "ACTIVE") != 0) {
+                h_compliance_flags |= 0x02;
+                userlog("PHASE 7: Account NOT ACTIVE (status=%s) — flag set",
+                        h_account_status);
+            }
+
+            /* PMLA check: high-value portfolio requires enhanced due diligence */
+            if (h_total_portfolio_value > 10000000.0) {
+                userlog("PHASE 7: PMLA — portfolio > ₹1Cr, enhanced due diligence required");
+                if (h_net_worth < h_total_portfolio_value * 0.50) {
+                    h_compliance_flags |= 0x04;
+                    userlog("PHASE 7: PMLA — net worth insufficient vs portfolio value");
+                }
+            }
+
+            /* SEBI margin rule check */
+            if (h_positions_in_margin > 0 && h_margin_deficit > 0.0) {
+                h_compliance_flags |= 0x08;
+                userlog("PHASE 7: SEBI — margin deficit in margin positions");
+            }
+        }
+
+        /* 7b: Risk Grade Classification */
+        {
+            /* Compute composite risk score from gathered metrics */
+            double risk_score = 0.0;
+
+            /* VaR contribution (0-30 points) */
+            double var_pct = h_total_portfolio_value > 0.0
+                ? h_var_95 / h_total_portfolio_value : 0.0;
+            if (var_pct > VAR_THRESHOLD_CRITICAL) {
+                risk_score += 30.0;
+            } else if (var_pct > VAR_THRESHOLD_HIGH) {
+                risk_score += 20.0;
+            } else if (var_pct > 0.10) {
+                risk_score += 10.0;
+            } else {
+                risk_score += 5.0;
+            }
+
+            /* Drawdown contribution (0-20 points) */
+            if (h_max_drawdown > 0.40) {
+                risk_score += 20.0;
+            } else if (h_max_drawdown > 0.25) {
+                risk_score += 12.0;
+            } else if (h_max_drawdown > 0.15) {
+                risk_score += 6.0;
+            } else {
+                risk_score += 2.0;
+            }
+
+            /* Stress contribution (0-20 points) */
+            double max_stress = dmax(h_stress_loss_pct,
+                                     dmax(h_stress_loss_pct_2, h_stress_loss_pct_3));
+            if (max_stress > 0.25) {
+                risk_score += 20.0;
+            } else if (max_stress > 0.15) {
+                risk_score += 12.0;
+            } else if (max_stress > 0.10) {
+                risk_score += 6.0;
+            } else {
+                risk_score += 2.0;
+            }
+
+            /* Concentration contribution (0-15 points) */
+            if (h_concentration_risk > 70.0) {
+                risk_score += 15.0;
+            } else if (h_concentration_risk > 40.0) {
+                risk_score += 8.0;
+            } else {
+                risk_score += 2.0;
+            }
+
+            /* Liquidity contribution (0-15 points) */
+            if (h_liquidity_score < 20.0) {
+                risk_score += 15.0;
+            } else if (h_liquidity_score < 50.0) {
+                risk_score += 8.0;
+            } else {
+                risk_score += 2.0;
+            }
+
+            /* Assign grade */
+            if (risk_score >= 75.0) {
+                strcpy(h_risk_grade, "CRITICAL");
+            } else if (risk_score >= 50.0) {
+                strcpy(h_risk_grade, "HIGH");
+            } else if (risk_score >= 25.0) {
+                strcpy(h_risk_grade, "MEDIUM");
+            } else {
+                strcpy(h_risk_grade, "LOW");
+            }
+
+            userlog("PHASE 7: Composite risk score=%.1f → grade=%s",
+                    risk_score, h_risk_grade);
+        }
+
+        /* 7c: Action Required */
+        {
+            int pos = 0;
+            memset(h_action_required, 0, sizeof(h_action_required));
+
+            if (h_compliance_flags & 0x01) {
+                pos += snprintf(h_action_required + pos,
+                    sizeof(h_action_required) - pos, "KYC_PENDING;");
+            }
+            if (h_compliance_flags & 0x02) {
+                pos += snprintf(h_action_required + pos,
+                    sizeof(h_action_required) - pos, "ACCOUNT_REVIEW;");
+            }
+            if (strcmp(h_risk_grade, "CRITICAL") == 0) {
+                pos += snprintf(h_action_required + pos,
+                    sizeof(h_action_required) - pos, "IMMEDIATE_RISK_REVIEW;");
+            }
+            if (h_margin_deficit > 0.0) {
+                pos += snprintf(h_action_required + pos,
+                    sizeof(h_action_required) - pos, "MARGIN_CALL_NEEDED;");
+            }
+            if (h_concentration_risk > 70.0) {
+                pos += snprintf(h_action_required + pos,
+                    sizeof(h_action_required) - pos, "DIVERSIFY_PORTFOLIO;");
+            }
+            if (h_max_stock_concentration > CONC_THRESHOLD_STOCK) {
+                pos += snprintf(h_action_required + pos,
+                    sizeof(h_action_required) - pos, "REDUCE_%s_POSITION;",
+                    h_max_stock_ticker);
+            }
+            if (pos == 0) {
+                strcpy(h_action_required, "NO_ACTION_REQUIRED");
+            }
+
+            userlog("PHASE 7: Actions: %s (flags=0x%02X)",
+                    h_action_required, h_compliance_flags);
+        }
+
+        /* Update risk assessment */
+        EXEC SQL UPDATE risk_assessment_results
+            SET risk_grade = :h_risk_grade,
+                action_required = :h_action_required
+            WHERE request_id = :h_request_id
+              AND client_code = :h_client_code
+              AND risk_date = :h_risk_date;
+
+        h_rows_processed++;
+    } else {
+        userlog("── Phase 7: SKIPPED (SF_COMPLIANCE not set) ──");
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * PHASE 8: Internal tpcall Chaining (SF_INTERNAL)
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    if (h_scenario_flag & SF_INTERNAL) {
+        userlog("── Phase 8: Internal tpcall Chaining ──");
+        EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+        /* 8a: Call BATCH_EQUITY_REPORT for formatted risk summary */
+        {
+            char report_input[512];
+            char *report_output = NULL;
+            long report_olen = 0;
+
+            snprintf(report_input, sizeof(report_input),
+                     "RISK_REPORT|%s|%s|%s|%.2f|%.2f|%.2f|%s",
+                     h_client_code, h_risk_date, h_request_id,
+                     h_var_95, h_max_drawdown, h_sharpe_ratio, h_risk_grade);
+
+            userlog("PHASE 8: tpcall → BATCH_EQUITY_REPORT");
+            int rc = tpcall("BATCH_EQUITY_REPORT", report_input,
+                            strlen(report_input) + 1,
+                            &report_output, &report_olen, 0);
+
+            if (rc == 0 && report_output) {
+                userlog("PHASE 8: BATCH_EQUITY_REPORT returned: %s", report_output);
+                free(report_output);
+            } else {
+                userlog("PHASE 8: BATCH_EQUITY_REPORT call failed (rc=%d)", rc);
+            }
+        }
+
+        /* 8b: Call BATCH_PORTFOLIO_PROCESSOR for margin re-evaluation */
+        {
+            char pf_input[512];
+            char *pf_output = NULL;
+            long pf_olen = 0;
+
+            snprintf(pf_input, sizeof(pf_input),
+                     "RISK_TRIGGERED|%s|%s|MARGIN_CHECK|%.2f|%.2f",
+                     h_client_code, h_risk_date,
+                     h_margin_deficit, h_total_portfolio_value);
+
+            userlog("PHASE 8: tpcall → BATCH_PORTFOLIO_PROCESSOR");
+            int rc = tpcall("BATCH_PORTFOLIO_PROCESSOR", pf_input,
+                            strlen(pf_input) + 1,
+                            &pf_output, &pf_olen, 0);
+
+            if (rc == 0 && pf_output) {
+                userlog("PHASE 8: BATCH_PORTFOLIO_PROCESSOR returned: %s", pf_output);
+                free(pf_output);
+            } else {
+                userlog("PHASE 8: BATCH_PORTFOLIO_PROCESSOR call failed (rc=%d)", rc);
+            }
+        }
+
+        h_rows_processed++;
+    } else {
+        userlog("── Phase 8: SKIPPED (SF_INTERNAL not set) ──");
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * PHASE 9: FML Output Buffer Construction
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    userlog("── Phase 9: FML Output ──");
+
+    {
+        FML_BUF *outbuf = Falloc();
+        if (!outbuf) {
+            userlog("PHASE 9: FALLOC failed");
+            snprintf(h_status_msg, sizeof(h_status_msg),
+                     "FAIL|FALLOC error|request=%s", h_request_id);
+            tpreturn(TPFAIL, 0, h_status_msg, strlen(h_status_msg) + 1, 0);
+            return;
+        }
+
+        /* Populate all 16 output fields */
+        Fadd(outbuf, FLD_VAR_95,              &h_var_95, sizeof(double));
+        Fadd(outbuf, FLD_VAR_99,              &h_var_99, sizeof(double));
+        Fadd(outbuf, FLD_MAX_DRAWDOWN,        &h_max_drawdown, sizeof(double));
+        Fadd(outbuf, FLD_SHARPE_RATIO,        &h_sharpe_ratio, sizeof(double));
+        Fadd(outbuf, FLD_BETA_WEIGHTED,       &h_beta_weighted, sizeof(double));
+        Fadd(outbuf, FLD_STRESS_LOSS_PCT,     &h_stress_loss_pct, sizeof(double));
+        Fadd(outbuf, FLD_STRESS_LOSS_PCT_2,   &h_stress_loss_pct_2, sizeof(double));
+        Fadd(outbuf, FLD_STRESS_LOSS_PCT_3,   &h_stress_loss_pct_3, sizeof(double));
+        Fadd(outbuf, FLD_MARGIN_DEFICIT,      &h_margin_deficit, sizeof(double));
+        Fadd(outbuf, FLD_CONCENTRATION_RISK,  &h_concentration_risk, sizeof(double));
+        Fadd(outbuf, FLD_LIQUIDITY_SCORE,     &h_liquidity_score, sizeof(double));
+        Fadd(outbuf, FLD_RISK_GRADE,          h_risk_grade, strlen(h_risk_grade));
+        Fadd(outbuf, FLD_ACTION_REQUIRED,     h_action_required, strlen(h_action_required));
+        Fadd(outbuf, FLD_TOTAL_EXPOSURE,      &h_total_exposure, sizeof(double));
+        Fadd(outbuf, FLD_HEDGE_EFFECTIVENESS, &h_hedge_effectiveness, sizeof(double));
+        Fadd(outbuf, FLD_SECTOR_EXPOSURE_JSON, h_sector_exposure_json,
+             strlen(h_sector_exposure_json));
+
+        userlog("PHASE 9: Output FML buffer populated with %d fields",
+                outbuf->field_count);
+
+        if (h_scenario_flag & SF_DEBUG) {
+            userlog("DEBUG: Output fields:");
+            for (int i = 0; i < outbuf->field_count; i++) {
+                FML_FIELD *f = &outbuf->fields[i];
+                switch (f->type) {
+                    case FLD_STRING:
+                        userlog("  fldid=%d: str='%s'", f->fldid, f->str_val);
+                        break;
+                    case FLD_INT:
+                        userlog("  fldid=%d: int=%d", f->fldid, f->int_val);
+                        break;
+                    case FLD_DOUBLE:
+                        userlog("  fldid=%d: dbl=%.4f", f->fldid, f->dbl_val);
+                        break;
+                }
+            }
+        }
+
+        /* ── Log batch completion ── */
+        EXEC SQL WHENEVER SQLERROR CONTINUE;
+        EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed)
+            VALUES ('BATCH_COMPREHENSIVE_RISK', 'SUCCESS', :h_rows_processed);
+
+        /* ── Update sector exposure in risk results ── */
+        EXEC SQL UPDATE risk_assessment_results
+            SET sector_exposure_json = :h_sector_exposure_json,
+                hedge_effectiveness = :h_hedge_effectiveness
+            WHERE request_id = :h_request_id
+              AND client_code = :h_client_code
+              AND risk_date = :h_risk_date;
+
+        /* ── Return FML buffer ── */
+        snprintf(h_status_msg, sizeof(h_status_msg),
+                 "OK|phases=%d|errors=%d|grade=%s|request=%s",
+                 h_rows_processed, h_phase_errors, h_risk_grade, h_request_id);
+
+        userlog("PHASE 9: Return message: %s", h_status_msg);
+
+        tpreturn(TPSUCCESS, 0, (char *)outbuf, sizeof(FML_BUF), 0);
+        /* NOTE: outbuf ownership transfers to tpreturn; Ffree not needed */
+        return;
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════
+     * PHASE 10: Fallback Return (no FML buffer)
+     * ═══════════════════════════════════════════════════════════════════ */
+
+    userlog("── Phase 10: Fallback Return (STRING buffer) ──");
+
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed)
+        VALUES ('BATCH_COMPREHENSIVE_RISK', 'SUCCESS', :h_rows_processed);
+
+    snprintf(h_status_msg, sizeof(h_status_msg),
+             "OK|phases=%d|errors=%d|grade=%s|var95=%.2f|sharpe=%.3f|"
+             "concentration=%.1f|liquidity=%.1f|request=%s",
+             h_rows_processed, h_phase_errors, h_risk_grade,
+             h_var_95, h_sharpe_ratio, h_concentration_risk,
+             h_liquidity_score, h_request_id);
+
+    userlog("══════ BATCH_COMPREHENSIVE_RISK: Complete. %s ══════", h_status_msg);
+    tpreturn(TPSUCCESS, 0, h_status_msg, strlen(h_status_msg) + 1, 0);
+}

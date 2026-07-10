@@ -1,0 +1,227 @@
+/*
+ * batch_transform.pc - Tuxedo Batch Transformation Service
+ *
+ * Transforms validated staging data into final tables.
+ * Performs:
+ *   - Word count computation on post bodies
+ *   - Insert into posts (final table)
+ *   - Aggregate statistics into post_stats per user
+ *
+ * Service: BATCH_TRANSFORM
+ * Pattern: Read-Transform-Write with aggregate computation
+ *          Uses tpforward to chain into BATCH_REPORT on completion.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <atmi.h>
+#include <userlog.h>
+
+EXEC SQL INCLUDE SQLCA;
+
+/* ─── Host Variable Declarations ──────────────────────────────────────── */
+
+EXEC SQL BEGIN DECLARE SECTION;
+    VARCHAR uid[30];
+    VARCHAR pwd[30];
+
+    /* Source row from staging */
+    int     h_post_id;
+    int     h_user_id;
+    char    h_title[256];
+    char    h_body[1024];
+    int     h_batch_id;
+
+    /* Computed values */
+    int     h_word_count;
+
+    /* Transform counters */
+    int     h_transformed_count;
+    int     h_error_count;
+    int     h_skip_count;
+
+    /* Aggregate query results */
+    int     h_agg_user_id;
+    int     h_agg_count;
+    int     h_agg_total_words;
+
+    char    h_status_msg[512];
+EXEC SQL END DECLARE SECTION;
+
+/* ─── Cursor Declaration ──────────────────────────────────────────────── */
+
+EXEC SQL DECLARE c_validated CURSOR FOR
+    SELECT id, user_id, title, body
+    FROM posts_staging
+    WHERE ingest_status = 'VALIDATED'
+      AND ingest_batch_id = :h_batch_id;
+
+/* ─── tpsvrinit ────────────────────────────────────────────────────────── */
+
+int tpsvrinit(int argc, char *argv[])
+{
+    userlog("tpsvrinit: Initializing BATCH_TRANSFORM server");
+
+    strcpy((char *)uid.arr, "batch_user");
+    uid.len = strlen((char *)uid.arr);
+    strcpy((char *)pwd.arr, "batch_pass");
+    pwd.len = strlen((char *)pwd.arr);
+
+    EXEC SQL CONNECT :uid IDENTIFIED BY :pwd;
+
+    if (sqlca.sqlcode != 0) {
+        userlog("tpsvrinit: CONNECT failed");
+        return -1;
+    }
+
+    userlog("tpsvrinit: Database connected for transformation");
+    return 0;
+}
+
+/* ─── tpsvrdone ────────────────────────────────────────────────────────── */
+
+void tpsvrdone(void)
+{
+    EXEC SQL COMMIT WORK RELEASE;
+    userlog("tpsvrdone: Transform server shutdown. Transformed=%d",
+            h_transformed_count);
+}
+
+/* ─── compute_word_count: Business logic for transformation ──────────────
+ *
+ * Counts words in body text. In production, this might include
+ * stop-word removal, stemming, or language detection.
+ */
+
+static int compute_word_count(const char *text)
+{
+    int count = 0;
+    int in_word = 0;
+
+    if (!text) return 0;
+
+    for (const char *p = text; *p; p++) {
+        if (isspace((unsigned char)*p)) {
+            in_word = 0;
+        } else if (!in_word) {
+            in_word = 1;
+            count++;
+        }
+    }
+    return count;
+}
+
+/* ─── BATCH_TRANSFORM Service ──────────────────────────────────────────── */
+
+void BATCH_TRANSFORM(TPSVCINFO *rqst)
+{
+    userlog("BATCH_TRANSFORM: Starting transformation. Input='%s'", rqst->data);
+
+    h_batch_id = atoi(rqst->data ? rqst->data : "0");
+    if (h_batch_id == 0) {
+        EXEC SQL SELECT MAX(ingest_batch_id) INTO :h_batch_id
+            FROM posts_staging
+            WHERE ingest_status = 'VALIDATED';
+    }
+
+    userlog("BATCH_TRANSFORM: Processing batch_id=%d", h_batch_id);
+
+    h_transformed_count = 0;
+    h_error_count = 0;
+    h_skip_count = 0;
+
+    /* ── Transformation loop ──
+     * Cursor-based: fetch from staging, transform, insert into final.
+     * In production, this would use array fetch (FETCH ... BULK COLLECT)
+     * for better throughput on large datasets.
+     */
+
+    EXEC SQL WHENEVER SQLERROR GOTO transform_error;
+
+    EXEC SQL OPEN c_validated;
+
+    for (;;) {
+        EXEC SQL FETCH c_validated INTO
+            :h_post_id, :h_user_id, :h_title, :h_body;
+
+        if (sqlca.sqlcode == 100) break;   /* NO DATA */
+        if (sqlca.sqlcode != 0) {
+            userlog("FETCH error. sqlcode=%ld", sqlca.sqlcode);
+            break;
+        }
+
+        /* ── Business Transformation ── */
+        h_word_count = compute_word_count(h_body);
+
+        /* Validate word count (skip records with no meaningful content) */
+        if (h_word_count < 5) {
+            h_skip_count++;
+            EXEC SQL UPDATE posts_staging
+                SET ingest_status = 'TRANSFORMED'
+                WHERE id = :h_post_id;
+            continue;
+        }
+
+        /* ── Insert into final posts table ── */
+        EXEC SQL INSERT INTO posts (id, user_id, title, body, word_count)
+            VALUES (:h_post_id, :h_user_id, :h_title, :h_body, :h_word_count);
+
+        /* ── Upsert into post_stats (per-user aggregate) ── */
+        EXEC SQL SELECT COUNT(*), COALESCE(SUM(word_count), 0)
+            INTO :h_agg_count, :h_agg_total_words
+            FROM posts
+            WHERE user_id = :h_user_id;
+
+        EXEC SQL INSERT OR REPLACE INTO post_stats
+                (user_id, post_count, total_words, avg_words)
+            VALUES (:h_user_id, :h_agg_count, :h_agg_total_words,
+                    CAST(:h_agg_total_words AS REAL) / CAST(:h_agg_count AS REAL));
+
+        /* ── Mark staging record as transformed ── */
+        EXEC SQL UPDATE posts_staging
+            SET ingest_status = 'TRANSFORMED'
+            WHERE id = :h_post_id;
+
+        h_transformed_count++;
+
+        /* Commit every 200 records */
+        if (h_transformed_count % 200 == 0) {
+            EXEC SQL COMMIT;
+            userlog("BATCH_TRANSFORM: Progress: %d records transformed",
+                    h_transformed_count);
+        }
+    }
+
+    EXEC SQL CLOSE c_validated;
+    EXEC SQL COMMIT;
+
+    /* ── Log batch completion ── */
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed)
+        VALUES ('BATCH_TRANSFORM', 'SUCCESS', :h_transformed_count);
+
+    /* ── Build return message ── */
+    snprintf(h_status_msg, sizeof(h_status_msg),
+             "OK|transformed=%d|skipped=%d|errors=%d|batch_id=%d",
+             h_transformed_count, h_skip_count, h_error_count, h_batch_id);
+
+    userlog("BATCH_TRANSFORM: %s", h_status_msg);
+
+    /*
+     * Forward to BATCH_REPORT using Tuxedo service chaining.
+     * tpforward() passes control directly — BATCH_REPORT's tpreturn()
+     * will send the final reply to the original client.
+     */
+    tpforward("BATCH_REPORT", h_status_msg, strlen(h_status_msg) + 1, 0);
+    return;
+
+transform_error:
+    EXEC SQL ROLLBACK;
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed, error_message)
+        VALUES ('BATCH_TRANSFORM', 'FAILED', :h_transformed_count, 'SQL error during transform');
+
+    snprintf(h_status_msg, sizeof(h_status_msg),
+             "FAIL|transformed=%d|sqlcode=%ld", h_transformed_count, sqlca.sqlcode);
+    tpreturn(TPFAIL, sqlca.sqlcode, h_status_msg, 0, 0);
+}

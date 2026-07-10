@@ -1,0 +1,67 @@
+
+╔══════════════════════════════════════════════════════════╗
+║  ICICI SECURITIES — TUXEDO BATCH PROCESSING            ║
+║  NSE Equity Data Pipeline (Pro*C + Turso/SQLite)      ║
+╚══════════════════════════════════════════════════════════╝
+
+
+─── BATCH_MARKET_ANALYTICS ───
+
+╔══════════════════════════════════════════════════════════════════╗
+║  ICICI SECURITIES — COMPREHENSIVE MARKET ANALYTICS            ║
+║  Multi-Factor Model | Technical + Fundamental + Sentiment     ║
+╚══════════════════════════════════════════════════════════════════╝
+
+┌─── A. MARKET BREADTH INDICATORS ───────────────────────────┐
+│ Total Stocks Analyzed      :      0                          │
+│   Large Cap (>20K Cr)     :      0                          │
+│   Mid Cap (5K-20K Cr)     :      0                          │
+│   Small Cap (<5K Cr)      :      0                          │
+│ Total Market Cap           :            0 Cr                 │
+│                                                            │
+│ Above SMA-50               :      0  (  0.0%)               │
+│ Above SMA-200              :      0  (  0.0%)               │
+│ Positive 1-Mo Momentum     :      0  (  0.0%)               │
+│ Advance/Decline Ratio      :     1.00                        │
+│ Market P/E (avg)           :     0.00                        │
+│ Market ROE (avg)           :     0.00%                       │
+└────────────────────────────────────────────────────────────┘
+
+┌─── B. SECTOR RANKINGS (by market cap) ────────────────────┐
+└────────────────────────────────────────────────────────────┘
+
+┌─── C. MULTI-FACTOR MODEL SUMMARY ─────────────────────────┐
+│ Factors computed per stock:                               │
+│   1. Value      (P/E, P/B, P/S, PEG, Div Yield)          │
+│   2. Growth     (Rev, Earnings, Qtrly, Fwd est.)         │
+│   3. Quality    (ROE, ROA, Margins, Debt, Cash Flow)     │
+│   4. Momentum   (1M/3M/6M, SMA cross, RSI, MACD)         │
+│   5. Low Vol    (Beta, Volatility, Debt, Dividends)      │
+│                                                            │
+│ Scoring: 0-100 per factor. Composite = weighted blend.     │
+│ Ratings: STRONG_BUY > BUY > ACCUMULATE > HOLD >           │
+│          REDUCE > SELL > STRONG_SELL                       │
+└────────────────────────────────────────────────────────────┘
+
+┌─── D. TOP COMPOSITE SCORE ────────────────────────────────┐
+│ Best Stock:               Score: 0/500                    │
+│ Largest by Market Cap:               0 Cr                │
+└────────────────────────────────────────────────────────────┘
+
+┌─── E. PROCESSING STATISTICS ──────────────────────────────┐
+│ Phase 1 — Technical Indicators  :        0 rows             │
+│ Phase 2 — Fundamental Scoring    :        0 stocks           │
+│ Phase 3 — Sector Aggregation     :        0 sectors          │
+│ Phase 4 — Peer Groups            :        0 entries          │
+│ Phase 5 — Market Breadth         :        0 indicators       │
+│ Errors (skipped)                 :        0                   │
+└────────────────────────────────────────────────────────────┘
+
+╔══════════════════════════════════════════════════════════════════╗
+║  END OF MARKET ANALYTICS — ICICI SECURITIES RESEARCH          ║
+╚══════════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════╗
+║     BATCH PROCESSING COMPLETE                           ║
+╚══════════════════════════════════════════════════════════╝

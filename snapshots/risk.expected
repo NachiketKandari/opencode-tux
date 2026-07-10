@@ -1,0 +1,25 @@
+
+╔══════════════════════════════════════════════════════════╗
+║  ICICI SECURITIES — TUXEDO BATCH PROCESSING            ║
+║  NSE Equity Data Pipeline (Pro*C + Turso/SQLite)      ║
+╚══════════════════════════════════════════════════════════╝
+
+
+─── BATCH_COMPREHENSIVE_RISK ───
+  Risk Assessment Complete:
+  ─────────────────────────
+  VaR 95%:           ₹332680.52
+  VaR 99%:           ₹550762.54
+  Sharpe Ratio:       -1.400
+  Max Drawdown:       81.46%
+  Weighted Beta:      0.878
+  Stress Loss (S1):   19.53%
+  Concentration Risk: 13.6/100
+  Liquidity Score:    100.0/100
+  Risk Grade:         MEDIUM
+  Action Required:    NO_ACTION_REQUIRED
+  Margin Deficit:    ₹0.00
+
+╔══════════════════════════════════════════════════════════╗
+║     BATCH PROCESSING COMPLETE                           ║
+╚══════════════════════════════════════════════════════════╝

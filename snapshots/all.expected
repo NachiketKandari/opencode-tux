@@ -1,0 +1,177 @@
+
+╔══════════════════════════════════════════════════════════╗
+║  ICICI SECURITIES — TUXEDO BATCH PROCESSING            ║
+║  NSE Equity Data Pipeline (Pro*C + Turso/SQLite)      ║
+╚══════════════════════════════════════════════════════════╝
+
+
+─── Phase 1: BATCH_EQUITY_INGEST ───
+  Result: OK|ingested=200|batch_id=EPOCH|skipped=0|batches=2
+
+─── Phase 2: BATCH_EQUITY_VALIDATE ───
+  Result: OK|total=200|valid=200|error=0|r1=0|r2=0|r3=0|r4=0|r5=0|r6=0
+
+─── Phase 3: BATCH_EQUITY_TRANSFORM ───
+  Result: 
+╔══════════════════════════════════════════════════════════════╗
+║    ICICI SECURITIES — END OF DAY MARKET SUMMARY            ║
+║    Report Date: YYYY-MM-DD HH:MM                               ║
+╚══════════════════════════════════════════════════════════════╝
+
+┌─── MARKET OVERVIEW ──────────────────────────────────────┐
+│ Total records processed :    200                          │
+│ Distinct stocks         :     49                          │
+│ Advancing (close>open)  :    115                          │
+│ Declining (close<open)  :     85                          │
+│ Unchanged               :      0                          │
+│ Total traded volume     :     EPOCH                     │
+└──────────────────────────────────────────────────────────┘
+
+┌─── TOP MOVERS ──────────────────────────────────────────┐
+│ Top Gainer    : BRITANNIA   +4.54%                      │
+│ Top Loser     : INFY        -1.86%                      │
+│ Most Active   : TECHM       49454545 shares                   │
+└──────────────────────────────────────────────────────────┘
+
+┌─── MARKET FUNDAMENTALS ─────────────────────────────────┐
+│ Avg P/E Ratio           :     0.00                       │
+│ Avg ROE %               :     0.00%                      │
+│ Total Market Cap (Cr)   :         0.00 Cr                  │
+└──────────────────────────────────────────────────────────┘
+
+┌─── CLIENT PORTFOLIO SUMMARY ───────────────────────────┐
+│ Total Users             :      0                          │
+│ Active Users            :      0                          │
+│ Total AUM (INR)         :           0.00                      │
+│ Portfolio Holdings      :      0                          │
+│ Pending Margin Calls    :      0                          │
+└──────────────────────────────────────────────────────────┘
+
+┌─── TRANSACTION SUMMARY ─────────────────────────────────┐
+│ Total Transactions      :        0                         │
+│ Total Brokerage (INR)   :           0.00                      │
+└──────────────────────────────────────────────────────────┘
+
+┌─── SECTOR BREAKDOWN ───────────────────────────────────┐
+└──────────────────────────────────────────────────────────┘
+
+┌─── BATCH EXECUTION LOG ────────────────────────────────┐
+│ BATCH_EQUITY_TRANSFORM SUCCESS       200 rows  YYYY-MM-DD HH:MM  │
+│ BATCH_EQUITY_VALIDATE SUCCESS       200 rows  YYYY-MM-DD HH:MM  │
+│ BATCH_EQUITY_INGEST  SUCCESS       200 rows  YYYY-MM-DD HH:MM  │
+└──────────────────────────────────────────────────────────┘
+
+╔══════════════════════════════════════════════════════════════╗
+║  END OF REPORT — ICICI SECURITIES BATCH PROCESSING        ║
+╚══════════════════════════════════════════════════════════════╝
+
+
+─── Phase 4: BATCH_EQUITY_REPORT ───
+  (delivered via tpforward chain from TRANSFORM)
+
+─── BATCH_PORTFOLIO_PROCESSOR ───
+
+╔══════════════════════════════════════════════════════════════╗
+║    ICICI SECURITIES — PORTFOLIO ANALYTICS REPORT          ║
+╚══════════════════════════════════════════════════════════════╝
+
+┌─── USER SUMMARY ───────────────────────────────────────────┐
+│ Total Users              :      0                            │
+│ Active Users             :      0                            │
+│ Dormant Users            :      0                            │
+│ Closed Accounts          :      0                            │
+│                                                           │
+│ By Risk Profile:                                          │
+│   Aggressive             :      0                            │
+│   Moderate               :      0                            │
+│   Conservative           :      0                            │
+│   High Risk (leveraged)  :      0                            │
+└───────────────────────────────────────────────────────────┘
+
+┌─── POSITION SUMMARY ───────────────────────────────────────┐
+│ Total Positions          :      0                            │
+│   DELIVERY               :      0                            │
+│   MARGIN                 :      0                            │
+│   INTRADAY               :      0                            │
+│                                                           │
+│ Margin Calls Triggered   :      0                            │
+│ Concentration Breaches   :      0                            │
+└───────────────────────────────────────────────────────────┘
+
+
+
+─── BATCH_MARKET_ANALYTICS ───
+
+╔══════════════════════════════════════════════════════════════════╗
+║  ICICI SECURITIES — COMPREHENSIVE MARKET ANALYTICS            ║
+║  Multi-Factor Model | Technical + Fundamental + Sentiment     ║
+╚══════════════════════════════════════════════════════════════════╝
+
+┌─── A. MARKET BREADTH INDICATORS ───────────────────────────┐
+│ Total Stocks Analyzed      :      0                          │
+│   Large Cap (>20K Cr)     :      0                          │
+│   Mid Cap (5K-20K Cr)     :      0                          │
+│   Small Cap (<5K Cr)      :      0                          │
+│ Total Market Cap           :            0 Cr                 │
+│                                                            │
+│ Above SMA-50               :      0  (  0.0%)               │
+│ Above SMA-200              :      0  (  0.0%)               │
+│ Positive 1-Mo Momentum     :      0  (  0.0%)               │
+│ Advance/Decline Ratio      :     1.00                        │
+│ Market P/E (avg)           :     0.00                        │
+│ Market ROE (avg)           :     0.00%                       │
+└────────────────────────────────────────────────────────────┘
+
+┌─── B. SECTOR RANKINGS (by market cap) ────────────────────┐
+└────────────────────────────────────────────────────────────┘
+
+┌─── C. MULTI-FACTOR MODEL SUMMARY ─────────────────────────┐
+│ Factors computed per stock:                               │
+│   1. Value      (P/E, P/B, P/S, PEG, Div Yield)          │
+│   2. Growth     (Rev, Earnings, Qtrly, Fwd est.)         │
+│   3. Quality    (ROE, ROA, Margins, Debt, Cash Flow)     │
+│   4. Momentum   (1M/3M/6M, SMA cross, RSI, MACD)         │
+│   5. Low Vol    (Beta, Volatility, Debt, Dividends)      │
+│                                                            │
+│ Scoring: 0-100 per factor. Composite = weighted blend.     │
+│ Ratings: STRONG_BUY > BUY > ACCUMULATE > HOLD >           │
+│          REDUCE > SELL > STRONG_SELL                       │
+└────────────────────────────────────────────────────────────┘
+
+┌─── D. TOP COMPOSITE SCORE ────────────────────────────────┐
+│ Best Stock:               Score: 0/500                    │
+│ Largest by Market Cap:               0 Cr                │
+└────────────────────────────────────────────────────────────┘
+
+┌─── E. PROCESSING STATISTICS ──────────────────────────────┐
+│ Phase 1 — Technical Indicators  :        0 rows             │
+│ Phase 2 — Fundamental Scoring    :        0 stocks           │
+│ Phase 3 — Sector Aggregation     :        0 sectors          │
+│ Phase 4 — Peer Groups            :        0 entries          │
+│ Phase 5 — Market Breadth         :        0 indicators       │
+│ Errors (skipped)                 :        0                   │
+└────────────────────────────────────────────────────────────┘
+
+╔══════════════════════════════════════════════════════════════════╗
+║  END OF MARKET ANALYTICS — ICICI SECURITIES RESEARCH          ║
+╚══════════════════════════════════════════════════════════════════╝
+
+
+─── BATCH_COMPREHENSIVE_RISK ───
+  Risk Assessment Complete:
+  ─────────────────────────
+  VaR 95%:           ₹332680.52
+  VaR 99%:           ₹550762.54
+  Sharpe Ratio:       -1.400
+  Max Drawdown:       81.46%
+  Weighted Beta:      0.878
+  Stress Loss (S1):   19.53%
+  Concentration Risk: 13.6/100
+  Liquidity Score:    100.0/100
+  Risk Grade:         MEDIUM
+  Action Required:    NO_ACTION_REQUIRED
+  Margin Deficit:    ₹0.00
+
+╔══════════════════════════════════════════════════════════╗
+║     BATCH PROCESSING COMPLETE                           ║
+╚══════════════════════════════════════════════════════════╝

@@ -1,0 +1,189 @@
+/*
+ * batch_report.pc - Tuxedo Batch Report Generation Service
+ *
+ * Generates summary reports from the batch processing run.
+ * Queries post_stats for per-user summaries and batch_log for
+ * processing history.
+ *
+ * Service: BATCH_REPORT
+ * Pattern: Read-only reporting with aggregate queries
+ *          Typically runs at end of batch window.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <atmi.h>
+#include <userlog.h>
+
+EXEC SQL INCLUDE SQLCA;
+
+/* ─── Host Variable Declarations ──────────────────────────────────────── */
+
+EXEC SQL BEGIN DECLARE SECTION;
+    VARCHAR uid[30];
+    VARCHAR pwd[30];
+
+    /* Report data */
+    int     h_total_posts;
+    int     h_total_users;
+    int     h_total_words;
+    double  h_avg_words_per_post;
+    double  h_avg_posts_per_user;
+
+    /* Top user data */
+    int     h_top_user_id;
+    int     h_top_user_posts;
+    int     h_top_user_words;
+
+    /* Batch log query */
+    char    h_log_service[64];
+    char    h_log_status[16];
+    int     h_log_rows;
+    char    h_log_time[32];
+
+    /* Output buffer */
+    char    h_report[4096];
+    int     h_report_len;
+    char    h_status_msg[256];
+EXEC SQL END DECLARE SECTION;
+
+/* ─── Cursor for batch log ────────────────────────────────────────────── */
+
+EXEC SQL DECLARE c_batch_log CURSOR FOR
+    SELECT service_name, status, rows_processed,
+           COALESCE(completed_at, started_at)
+    FROM batch_log
+    ORDER BY batch_id DESC
+    LIMIT 20;
+
+/* ─── tpsvrinit ────────────────────────────────────────────────────────── */
+
+int tpsvrinit(int argc, char *argv[])
+{
+    userlog("tpsvrinit: Initializing BATCH_REPORT server");
+
+    strcpy((char *)uid.arr, "batch_user");
+    uid.len = strlen((char *)uid.arr);
+    strcpy((char *)pwd.arr, "batch_pass");
+    pwd.len = strlen((char *)pwd.arr);
+
+    EXEC SQL CONNECT :uid IDENTIFIED BY :pwd;
+
+    if (sqlca.sqlcode != 0) {
+        userlog("tpsvrinit: CONNECT failed. sqlcode=%ld", sqlca.sqlcode);
+        return -1;
+    }
+
+    userlog("tpsvrinit: Database connected for reporting");
+    return 0;
+}
+
+/* ─── tpsvrdone ────────────────────────────────────────────────────────── */
+
+void tpsvrdone(void)
+{
+    EXEC SQL COMMIT WORK RELEASE;
+    userlog("tpsvrdone: Report server shutdown");
+}
+
+/* ─── BATCH_REPORT Service ─────────────────────────────────────────────── */
+
+void BATCH_REPORT(TPSVCINFO *rqst)
+{
+    userlog("BATCH_REPORT: Generating batch summary report");
+    h_report[0] = '\0';
+    h_report_len = 0;
+
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+
+    /* ── 1. Overall Statistics ── */
+
+    EXEC SQL SELECT COUNT(*), COUNT(DISTINCT user_id),
+                   COALESCE(SUM(word_count), 0)
+        INTO :h_total_posts, :h_total_users, :h_total_words
+        FROM posts;
+
+    if (h_total_posts > 0) {
+        EXEC SQL SELECT CAST(SUM(word_count) AS REAL) / CAST(COUNT(*) AS REAL)
+            INTO :h_avg_words_per_post
+            FROM posts;
+
+        EXEC SQL SELECT CAST(COUNT(*) AS REAL) / CAST(COUNT(DISTINCT user_id) AS REAL)
+            INTO :h_avg_posts_per_user
+            FROM posts;
+    } else {
+        h_avg_words_per_post = 0.0;
+        h_avg_posts_per_user = 0.0;
+    }
+
+    /* ── 2. Top User ── */
+
+    EXEC SQL SELECT user_id, post_count, total_words
+        INTO :h_top_user_id, :h_top_user_posts, :h_top_user_words
+        FROM post_stats
+        ORDER BY post_count DESC
+        LIMIT 1;
+
+    if (sqlca.sqlcode == 100) {
+        /* No users yet */
+        h_top_user_id = 0;
+        h_top_user_posts = 0;
+        h_top_user_words = 0;
+        sqlca.sqlcode = 0;
+    }
+
+    /* ── 3. Build the report ── */
+    h_report_len = snprintf(h_report, sizeof(h_report),
+        "╔══════════════════════════════════════════════╗\n"
+        "║     TUXEDO BATCH PROCESSING REPORT          ║\n"
+        "╠══════════════════════════════════════════════╣\n"
+        "║ OVERALL STATISTICS                          ║\n"
+        "║   Total Posts:      %6d                  ║\n"
+        "║   Unique Users:     %6d                  ║\n"
+        "║   Total Words:      %6d                  ║\n"
+        "║   Avg Words/Post:   %8.2f               ║\n"
+        "║   Avg Posts/User:   %8.2f               ║\n"
+        "╠══════════════════════════════════════════════╣\n"
+        "║ TOP USER (user_id=%d)                      ║\n"
+        "║   Posts:            %6d                  ║\n"
+        "║   Total Words:      %6d                  ║\n"
+        "╠══════════════════════════════════════════════╣\n"
+        "║ BATCH LOG (recent runs)                     ║\n",
+        h_total_posts, h_total_users, h_total_words,
+        h_avg_words_per_post, h_avg_posts_per_user,
+        h_top_user_id, h_top_user_posts, h_top_user_words);
+
+    /* ── 4. Batch Log Entries ── */
+
+    EXEC SQL OPEN c_batch_log;
+
+    for (;;) {
+        EXEC SQL FETCH c_batch_log INTO
+            :h_log_service, :h_log_status, :h_log_rows, :h_log_time;
+
+        if (sqlca.sqlcode == 100) break;  /* NO DATA */
+        if (sqlca.sqlcode != 0) break;
+
+        h_report_len += snprintf(h_report + h_report_len,
+            sizeof(h_report) - h_report_len,
+            "║   %-16s %-8s %5d rows %s ║\n",
+            h_log_service, h_log_status, h_log_rows, h_log_time);
+    }
+
+    EXEC SQL CLOSE c_batch_log;
+
+    h_report_len += snprintf(h_report + h_report_len,
+        sizeof(h_report) - h_report_len,
+        "╚══════════════════════════════════════════════╝\n");
+
+    /* ── Log this report run ── */
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed)
+        VALUES ('BATCH_REPORT', 'SUCCESS', :h_total_posts);
+
+    userlog("BATCH_REPORT: Complete. %d posts across %d users",
+            h_total_posts, h_total_users);
+
+    /* ── Return report to caller ── */
+    tpreturn(TPSUCCESS, 0, h_report, h_report_len + 1, 0);
+}

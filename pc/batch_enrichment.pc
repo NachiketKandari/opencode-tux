@@ -1,0 +1,47 @@
+/* batch_enrichment.pc - stub */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <atmi.h>
+#include <userlog.h>
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    VARCHAR uid[30];
+    VARCHAR pwd[30];
+    char    h_status_msg[256];
+EXEC SQL END DECLARE SECTION;
+
+static void sql_error(char *msg)
+{
+    userlog("[FATAL] %s: sqlcode=%ld", msg, sqlca.sqlcode);
+    EXEC SQL ROLLBACK;
+}
+
+int tpsvrinit(int argc, char *argv[])
+{
+    (void)argc; (void)argv;
+    strcpy((char *)uid.arr, "batch_user");
+    uid.len = strlen((char *)uid.arr);
+    strcpy((char *)pwd.arr, "batch_pass");
+    pwd.len = strlen((char *)pwd.arr);
+    EXEC SQL WHENEVER SQLERROR DO sql_error("tpsvrinit CONNECT");
+    EXEC SQL CONNECT :uid IDENTIFIED BY :pwd;
+    userlog("tpsvrinit: BATCH_ENRICHMENT initialized");
+    return 0;
+}
+
+void tpsvrdone(void)
+{
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+    EXEC SQL COMMIT WORK RELEASE;
+    userlog("tpsvrdone: BATCH_ENRICHMENT shutdown");
+}
+
+void BATCH_ENRICHMENT(TPSVCINFO *rqst)
+{
+    userlog("BATCH_ENRICHMENT: stub — skipping");
+    snprintf(h_status_msg, sizeof(h_status_msg), "OK|stub=enrichment_skipped");
+    tpreturn(TPSUCCESS, 0, h_status_msg, strlen(h_status_msg) + 1, 0);
+}

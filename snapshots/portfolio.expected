@@ -1,0 +1,41 @@
+
+╔══════════════════════════════════════════════════════════╗
+║  ICICI SECURITIES — TUXEDO BATCH PROCESSING            ║
+║  NSE Equity Data Pipeline (Pro*C + Turso/SQLite)      ║
+╚══════════════════════════════════════════════════════════╝
+
+
+─── BATCH_PORTFOLIO_PROCESSOR ───
+
+╔══════════════════════════════════════════════════════════════╗
+║    ICICI SECURITIES — PORTFOLIO ANALYTICS REPORT          ║
+╚══════════════════════════════════════════════════════════════╝
+
+┌─── USER SUMMARY ───────────────────────────────────────────┐
+│ Total Users              :      0                            │
+│ Active Users             :      0                            │
+│ Dormant Users            :      0                            │
+│ Closed Accounts          :      0                            │
+│                                                           │
+│ By Risk Profile:                                          │
+│   Aggressive             :      0                            │
+│   Moderate               :      0                            │
+│   Conservative           :      0                            │
+│   High Risk (leveraged)  :      0                            │
+└───────────────────────────────────────────────────────────┘
+
+┌─── POSITION SUMMARY ───────────────────────────────────────┐
+│ Total Positions          :      0                            │
+│   DELIVERY               :      0                            │
+│   MARGIN                 :      0                            │
+│   INTRADAY               :      0                            │
+│                                                           │
+│ Margin Calls Triggered   :      0                            │
+│ Concentration Breaches   :      0                            │
+└───────────────────────────────────────────────────────────┘
+
+
+
+╔══════════════════════════════════════════════════════════╗
+║     BATCH PROCESSING COMPLETE                           ║
+╚══════════════════════════════════════════════════════════╝

@@ -1,0 +1,365 @@
+/*
+ * batch_equity_report.pc - Tuxedo Batch Equity Report Service
+ *
+ * Generates end-of-day market summary reports from processed equity data.
+ * Runs aggregate queries across stocks, users, portfolios, and transactions.
+ *
+ * Service: BATCH_EQUITY_REPORT
+ * Complexity: MEDIUM (~450 lines)
+ *
+ * Real-world analogue: ICICI Securities' EOD summary report that goes to
+ * branch heads, risk managers, and the dealing room every evening.
+ * Includes market-wide stats, top movers, sector performance, margin
+ * call summary, and batch execution audit trail.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <atmi.h>
+#include <userlog.h>
+
+EXEC SQL INCLUDE SQLCA;
+
+EXEC SQL BEGIN DECLARE SECTION;
+    VARCHAR uid[30];
+    VARCHAR pwd[30];
+
+    /* Aggregate SELECT INTO */
+    int     h_total_stocks;
+    int     h_total_distinct_tickers;
+    double  h_avg_daily_return;
+    double  h_sum_volume;
+    int     h_stocks_positive;
+    int     h_stocks_negative;
+    int     h_stocks_flat;
+    double  h_avg_pe;
+    double  h_avg_roe;
+    double  h_market_mcap;
+    int     h_total_users;
+    int     h_active_users;
+    double  h_total_aum;
+    int     h_margin_calls_today;
+    int     h_total_transactions;
+    double  h_total_brokerage;
+
+    /* Top movers */
+    char    h_top_gainer[32];
+    double  h_top_gainer_pct;
+    char    h_top_loser[32];
+    double  h_top_loser_pct;
+    char    h_most_active[32];
+    long    h_most_active_vol;
+
+    /* Sector aggregates */
+    char    h_best_sector[64];
+    double  h_best_sector_return;
+    char    h_worst_sector[64];
+    double  h_worst_sector_return;
+
+    /* Batch log cursor */
+    int     c_log_batch_id;
+    char    c_log_service[64];
+    char    c_log_status[16];
+    int     c_log_rows;
+    char    c_log_started[32];
+    char    c_log_completed[32];
+
+    /* Report buffer */
+    char    h_report[8192];
+    int     h_report_len;
+    char    h_status_msg[1024];
+    char    h_run_date[16];
+
+    /* Derived counts */
+    int     h_delivery_count;
+    int     h_margin_count;
+    int     h_intraday_count;
+    double  h_delivery_value;
+    double  h_margin_value;
+    double  h_intraday_value;
+EXEC SQL END DECLARE SECTION;
+
+static void sql_error(char *msg)
+{
+    userlog("[FATAL] %s: sqlcode=%ld", msg, sqlca.sqlcode);
+    EXEC SQL ROLLBACK;
+}
+
+/* ─── tpsvrinit ────────────────────────────────────────────────────── */
+
+int tpsvrinit(int argc, char *argv[])
+{
+    (void)argc; (void)argv;
+    userlog("tpsvrinit: Initializing BATCH_EQUITY_REPORT");
+
+    strcpy((char *)uid.arr, "batch_user");
+    uid.len = strlen((char *)uid.arr);
+    strcpy((char *)pwd.arr, "batch_pass");
+    pwd.len = strlen((char *)pwd.arr);
+
+    EXEC SQL WHENEVER SQLERROR DO sql_error("tpsvrinit CONNECT");
+    EXEC SQL CONNECT :uid IDENTIFIED BY :pwd;
+
+    if (sqlca.sqlcode != 0) {
+        userlog("tpsvrinit: CONNECT failed");
+        return -1;
+    }
+
+    userlog("tpsvrinit: BATCH_EQUITY_REPORT ready");
+    return 0;
+}
+
+/* ─── tpsvrdone ────────────────────────────────────────────────────── */
+
+void tpsvrdone(void)
+{
+    EXEC SQL WHENEVER SQLERROR CONTINUE;
+    EXEC SQL COMMIT WORK RELEASE;
+    userlog("tpsvrdone: Report generation complete");
+}
+
+/* ─── BATCH_EQUITY_REPORT Service ─────────────────────────────────────
+ *
+ * Called via tpforward from BATCH_EQUITY_TRANSFORM.
+ * Runs 12+ aggregate queries and formats a comprehensive EOD report.
+ *
+ * In ICICI Securities, this report is generated in multiple formats:
+ * plain text (for email), CSV (for downstream systems), and PDF
+ * (for management). We generate the text format here.
+ */
+
+void BATCH_EQUITY_REPORT(TPSVCINFO *rqst)
+{
+    userlog("BATCH_EQUITY_REPORT: Generating EOD summary report");
+    if (rqst->data) {
+        userlog("  Received from upstream: %s", (char *)rqst->data);
+    }
+
+    EXEC SQL WHENEVER SQLERROR GOTO report_error;
+
+    {
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        strftime(h_run_date, sizeof(h_run_date), "%Y-%m-%d %H:%M", tm_info);
+    }
+
+    h_report_len = 0;
+    memset(h_report, 0, sizeof(h_report));
+
+    /* ── Header ── */
+    h_report_len += snprintf(h_report + h_report_len, sizeof(h_report) - h_report_len,
+        "\n"
+        "╔══════════════════════════════════════════════════════════════╗\n"
+        "║    ICICI SECURITIES — END OF DAY MARKET SUMMARY            ║\n"
+        "║    Report Date: %s                               ║\n"
+        "╚══════════════════════════════════════════════════════════════╝\n"
+        "\n", h_run_date);
+
+    /* ── Section 1: Market Overview ── */
+    EXEC SQL SELECT COUNT(*), COUNT(DISTINCT ticker), AVG(close),
+               SUM(volume)
+        INTO :h_total_stocks, :h_total_distinct_tickers,
+             :h_avg_daily_return, :h_sum_volume
+        FROM equity_staging
+        WHERE ingest_status = 'TRANSFORMED';
+
+    EXEC SQL SELECT COUNT(*) INTO :h_stocks_positive
+        FROM equity_staging
+        WHERE ingest_status = 'TRANSFORMED' AND close > open;
+
+    EXEC SQL SELECT COUNT(*) INTO :h_stocks_negative
+        FROM equity_staging
+        WHERE ingest_status = 'TRANSFORMED' AND close < open;
+
+    h_stocks_flat = h_total_stocks - h_stocks_positive - h_stocks_negative;
+
+    h_report_len += snprintf(h_report + h_report_len, sizeof(h_report) - h_report_len,
+        "┌─── MARKET OVERVIEW ──────────────────────────────────────┐\n"
+        "│ Total records processed : %6d                          │\n"
+        "│ Distinct stocks         : %6d                          │\n"
+        "│ Advancing (close>open)  : %6d                          │\n"
+        "│ Declining (close<open)  : %6d                          │\n"
+        "│ Unchanged               : %6d                          │\n"
+        "│ Total traded volume     : %14.0f                     │\n"
+        "└──────────────────────────────────────────────────────────┘\n"
+        "\n",
+        h_total_stocks, h_total_distinct_tickers,
+        h_stocks_positive, h_stocks_negative, h_stocks_flat,
+        h_sum_volume);
+
+    /* ── Section 2: Top Movers ── */
+    EXEC SQL SELECT ticker, (close - open) / open * 100.0
+        INTO :h_top_gainer, :h_top_gainer_pct
+        FROM equity_staging
+        WHERE ingest_status = 'TRANSFORMED'
+        ORDER BY (close - open) / open * 100.0 DESC LIMIT 1;
+
+    EXEC SQL SELECT ticker, (close - open) / open * 100.0
+        INTO :h_top_loser, :h_top_loser_pct
+        FROM equity_staging
+        WHERE ingest_status = 'TRANSFORMED'
+        ORDER BY (close - open) / open * 100.0 ASC LIMIT 1;
+
+    EXEC SQL SELECT ticker, volume
+        INTO :h_most_active, :h_most_active_vol
+        FROM equity_staging
+        WHERE ingest_status = 'TRANSFORMED'
+        ORDER BY volume DESC LIMIT 1;
+
+    h_report_len += snprintf(h_report + h_report_len, sizeof(h_report) - h_report_len,
+        "┌─── TOP MOVERS ──────────────────────────────────────────┐\n"
+        "│ Top Gainer    : %-10s  %+.2f%%                      │\n"
+        "│ Top Loser     : %-10s  %+.2f%%                      │\n"
+        "│ Most Active   : %-10s  %ld shares                   │\n"
+        "└──────────────────────────────────────────────────────────┘\n"
+        "\n",
+        h_top_gainer, h_top_gainer_pct,
+        h_top_loser, h_top_loser_pct,
+        h_most_active, h_most_active_vol);
+
+    /* ── Section 3: Fundamental Averages ── */
+    EXEC SQL SELECT AVG(pe_ratio), AVG(roe_pct), SUM(market_cap_crore)
+        INTO :h_avg_pe, :h_avg_roe, :h_market_mcap
+        FROM stock_fundamentals;
+
+    h_report_len += snprintf(h_report + h_report_len, sizeof(h_report) - h_report_len,
+        "┌─── MARKET FUNDAMENTALS ─────────────────────────────────┐\n"
+        "│ Avg P/E Ratio           : %8.2f                       │\n"
+        "│ Avg ROE %%               : %8.2f%%                      │\n"
+        "│ Total Market Cap (Cr)   : %12.2f Cr                  │\n"
+        "└──────────────────────────────────────────────────────────┘\n"
+        "\n",
+        h_avg_pe, h_avg_roe, h_market_mcap);
+
+    /* ── Section 4: User & Portfolio Summary ── */
+    EXEC SQL SELECT COUNT(*) INTO :h_total_users FROM users;
+
+    EXEC SQL SELECT COUNT(*) INTO :h_active_users
+        FROM users WHERE account_status = 'ACTIVE';
+
+    EXEC SQL SELECT COUNT(*) INTO :h_margin_calls_today
+        FROM user_portfolios WHERE pledge_status = 'UNPLEDGED';
+
+    EXEC SQL SELECT SUM(invested_amount) INTO :h_total_aum
+        FROM user_portfolios;
+
+    EXEC SQL SELECT COUNT(*), COUNT(DISTINCT portfolio_type)
+        INTO :h_delivery_count, :h_margin_count
+        FROM user_portfolios;
+
+    h_report_len += snprintf(h_report + h_report_len, sizeof(h_report) - h_report_len,
+        "┌─── CLIENT PORTFOLIO SUMMARY ───────────────────────────┐\n"
+        "│ Total Users             : %6d                          │\n"
+        "│ Active Users            : %6d                          │\n"
+        "│ Total AUM (INR)         : %14.2f                      │\n"
+        "│ Portfolio Holdings      : %6d                          │\n"
+        "│ Pending Margin Calls    : %6d                          │\n"
+        "└──────────────────────────────────────────────────────────┘\n"
+        "\n",
+        h_total_users, h_active_users, h_total_aum,
+        h_delivery_count, h_margin_calls_today);
+
+    /* ── Section 5: Transaction Summary ── */
+    EXEC SQL SELECT COUNT(*), SUM(brokerage)
+        INTO :h_total_transactions, :h_total_brokerage
+        FROM user_transactions;
+
+    h_report_len += snprintf(h_report + h_report_len, sizeof(h_report) - h_report_len,
+        "┌─── TRANSACTION SUMMARY ─────────────────────────────────┐\n"
+        "│ Total Transactions      : %8d                         │\n"
+        "│ Total Brokerage (INR)   : %14.2f                      │\n"
+        "└──────────────────────────────────────────────────────────┘\n"
+        "\n",
+        h_total_transactions, h_total_brokerage);
+
+    /* ── Section 6: Sector Performance ── */
+    h_report_len += snprintf(h_report + h_report_len, sizeof(h_report) - h_report_len,
+        "┌─── SECTOR BREAKDOWN ───────────────────────────────────┐\n");
+
+    EXEC SQL DECLARE sector_cursor CURSOR FOR
+        SELECT sector, COUNT(*) as cnt
+        FROM stock_fundamentals
+        GROUP BY sector
+        ORDER BY cnt DESC LIMIT 10;
+
+    EXEC SQL OPEN sector_cursor;
+
+    if (sqlca.sqlcode == 0) {
+        char    s_sector[64];
+        int     s_count;
+        while (1) {
+            EXEC SQL FETCH sector_cursor INTO :s_sector, :s_count;
+            if (sqlca.sqlcode == 100) break;
+            if (sqlca.sqlcode != 0) break;
+
+            h_report_len += snprintf(h_report + h_report_len,
+                sizeof(h_report) - h_report_len,
+                "│ %-25s  %4d stocks                    │\n",
+                s_sector, s_count);
+        }
+    }
+    EXEC SQL CLOSE sector_cursor;
+
+    h_report_len += snprintf(h_report + h_report_len, sizeof(h_report) - h_report_len,
+        "└──────────────────────────────────────────────────────────┘\n"
+        "\n");
+
+    /* ── Section 7: Batch Execution Log ── */
+    h_report_len += snprintf(h_report + h_report_len, sizeof(h_report) - h_report_len,
+        "┌─── BATCH EXECUTION LOG ────────────────────────────────┐\n");
+
+    EXEC SQL DECLARE batch_log_cursor CURSOR FOR
+        SELECT batch_id, service_name, status, rows_processed,
+               started_at, COALESCE(completed_at, 'RUNNING')
+        FROM batch_log
+        ORDER BY batch_id DESC LIMIT 10;
+
+    EXEC SQL OPEN batch_log_cursor;
+
+    if (sqlca.sqlcode == 0) {
+        while (1) {
+            EXEC SQL FETCH batch_log_cursor INTO
+                :c_log_batch_id, :c_log_service, :c_log_status,
+                :c_log_rows, :c_log_started, :c_log_completed;
+
+            if (sqlca.sqlcode == 100) break;
+            if (sqlca.sqlcode != 0) break;
+
+            h_report_len += snprintf(h_report + h_report_len,
+                sizeof(h_report) - h_report_len,
+                "│ %-20s %-10s %6d rows  %s  │\n",
+                c_log_service, c_log_status,
+                c_log_rows, c_log_started);
+        }
+    }
+    EXEC SQL CLOSE batch_log_cursor;
+
+    h_report_len += snprintf(h_report + h_report_len, sizeof(h_report) - h_report_len,
+        "└──────────────────────────────────────────────────────────┘\n"
+        "\n");
+
+    /* ── Footer ── */
+    h_report_len += snprintf(h_report + h_report_len, sizeof(h_report) - h_report_len,
+        "╔══════════════════════════════════════════════════════════════╗\n"
+        "║  END OF REPORT — ICICI SECURITIES BATCH PROCESSING        ║\n"
+        "╚══════════════════════════════════════════════════════════════╝\n");
+
+    EXEC SQL COMMIT;
+
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed)
+        VALUES ('BATCH_EQUITY_REPORT', 'SUCCESS', :h_total_stocks);
+
+    userlog("BATCH_EQUITY_REPORT: Complete. Report size=%d bytes", h_report_len);
+    tpreturn(TPSUCCESS, 0, h_report, h_report_len + 1, 0);
+    return;
+
+report_error:
+    EXEC SQL ROLLBACK;
+    EXEC SQL INSERT INTO batch_log (service_name, status, rows_processed, error_message)
+        VALUES ('BATCH_EQUITY_REPORT', 'FAILED', 0, 'SQL error');
+    snprintf(h_status_msg, sizeof(h_status_msg),
+             "FAIL|sqlcode=%ld", sqlca.sqlcode);
+    tpreturn(TPFAIL, sqlca.sqlcode, h_status_msg, 0, 0);
+}

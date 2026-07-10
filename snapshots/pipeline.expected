@@ -1,0 +1,74 @@
+
+╔══════════════════════════════════════════════════════════╗
+║  ICICI SECURITIES — TUXEDO BATCH PROCESSING            ║
+║  NSE Equity Data Pipeline (Pro*C + Turso/SQLite)      ║
+╚══════════════════════════════════════════════════════════╝
+
+
+─── Phase 1: BATCH_EQUITY_INGEST ───
+  Result: OK|ingested=200|batch_id=EPOCH|skipped=0|batches=2
+
+─── Phase 2: BATCH_EQUITY_VALIDATE ───
+  Result: OK|total=200|valid=200|error=0|r1=0|r2=0|r3=0|r4=0|r5=0|r6=0
+
+─── Phase 3: BATCH_EQUITY_TRANSFORM ───
+  Result: 
+╔══════════════════════════════════════════════════════════════╗
+║    ICICI SECURITIES — END OF DAY MARKET SUMMARY            ║
+║    Report Date: YYYY-MM-DD HH:MM                               ║
+╚══════════════════════════════════════════════════════════════╝
+
+┌─── MARKET OVERVIEW ──────────────────────────────────────┐
+│ Total records processed :    200                          │
+│ Distinct stocks         :     49                          │
+│ Advancing (close>open)  :    115                          │
+│ Declining (close<open)  :     85                          │
+│ Unchanged               :      0                          │
+│ Total traded volume     :     EPOCH                     │
+└──────────────────────────────────────────────────────────┘
+
+┌─── TOP MOVERS ──────────────────────────────────────────┐
+│ Top Gainer    : BRITANNIA   +4.54%                      │
+│ Top Loser     : INFY        -1.86%                      │
+│ Most Active   : TECHM       49454545 shares                   │
+└──────────────────────────────────────────────────────────┘
+
+┌─── MARKET FUNDAMENTALS ─────────────────────────────────┐
+│ Avg P/E Ratio           :     0.00                       │
+│ Avg ROE %               :     0.00%                      │
+│ Total Market Cap (Cr)   :         0.00 Cr                  │
+└──────────────────────────────────────────────────────────┘
+
+┌─── CLIENT PORTFOLIO SUMMARY ───────────────────────────┐
+│ Total Users             :      0                          │
+│ Active Users            :      0                          │
+│ Total AUM (INR)         :           0.00                      │
+│ Portfolio Holdings      :      0                          │
+│ Pending Margin Calls    :      0                          │
+└──────────────────────────────────────────────────────────┘
+
+┌─── TRANSACTION SUMMARY ─────────────────────────────────┐
+│ Total Transactions      :        0                         │
+│ Total Brokerage (INR)   :           0.00                      │
+└──────────────────────────────────────────────────────────┘
+
+┌─── SECTOR BREAKDOWN ───────────────────────────────────┐
+└──────────────────────────────────────────────────────────┘
+
+┌─── BATCH EXECUTION LOG ────────────────────────────────┐
+│ BATCH_EQUITY_TRANSFORM SUCCESS       200 rows  YYYY-MM-DD HH:MM  │
+│ BATCH_EQUITY_VALIDATE SUCCESS       200 rows  YYYY-MM-DD HH:MM  │
+│ BATCH_EQUITY_INGEST  SUCCESS       200 rows  YYYY-MM-DD HH:MM  │
+└──────────────────────────────────────────────────────────┘
+
+╔══════════════════════════════════════════════════════════════╗
+║  END OF REPORT — ICICI SECURITIES BATCH PROCESSING        ║
+╚══════════════════════════════════════════════════════════════╝
+
+
+─── Phase 4: BATCH_EQUITY_REPORT ───
+  (delivered via tpforward chain from TRANSFORM)
+
+╔══════════════════════════════════════════════════════════╗
+║     BATCH PROCESSING COMPLETE                           ║
+╚══════════════════════════════════════════════════════════╝
