@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-10
 **Total converted:** 7 files (5 by DeepSeek V4 Pro + Claude Code, 2 by Qwen A35-3B + OpenCode)
-**Total tests:** 70/70 passing (26 DeepSeek, 44 Qwen)
+**Total tests:** 148/148 passing (26 DeepSeek, 122 Qwen)
 
 ---
 
